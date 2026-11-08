@@ -466,7 +466,10 @@ pub enum PaymentOutcome {
     NotDispatched,
     /// The payment was dispatched but its final status could not be determined.
     TrackPaymentFailed,
-    /// The payment failed at the provided index in the path.
+    /// The payment failed at the hop with the provided index in the path, meaning that the channel
+    /// `path.hops[index].short_channel_id` could not carry the HTLC. Index 0 is the sender's own
+    /// outgoing channel. An index equal to the number of hops means that the HTLC reached the
+    /// recipient, but it was rejected there (e.g. by an interceptor).
     IndexFailure(usize),
 }
 

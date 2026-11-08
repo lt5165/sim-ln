@@ -809,7 +809,12 @@ impl<T: SimNetwork, C: Clock> LightningNode for SimNode<T, C> {
                                     if payment_result.payment_outcome == PaymentOutcome::Success {
                                         scorer.payment_path_successful(path, duration);
                                     } else if let PaymentOutcome::IndexFailure(index) = payment_result.payment_outcome {
-                                        scorer.payment_path_failed(path, index as u64, duration);
+                                        // The scorer expects the short channel id of the failing channel, not the
+                                        // hop index. If the index is past the end of the path, the HTLC reached the
+                                        // recipient and was rejected there, so there is no channel to penalize.
+                                        if let Some(hop) = path.hops.get(index) {
+                                            scorer.payment_path_failed(path, hop.short_channel_id, duration);
+                                        }
                                     }
                                 },
                                 None => {
@@ -1600,9 +1605,11 @@ async fn propagate_payment(request: PropagatePaymentRequest) {
                 "Forwarding failure for simulated payment {}: {fwd_err}",
                 hex::encode(request.payment_hash.0)
             );
+            // fail_idx is the index of the last hop whose channel successfully added the HTLC (None if
+            // the very first add failed), so the channel that failed is the one at the following hop.
             PaymentResult {
                 htlc_count: 0,
-                payment_outcome: PaymentOutcome::IndexFailure(fail_idx.unwrap_or(0)),
+                payment_outcome: PaymentOutcome::IndexFailure(fail_idx.map_or(0, |i| i + 1)),
             }
         },
         Err(critical_err) => {
@@ -1662,7 +1669,7 @@ mod tests {
     use crate::clock::SimulationClock;
     use crate::test_utils::get_random_keypair;
     use lightning::routing::router::build_route_from_hops;
-    use lightning::routing::router::Route;
+    use lightning::routing::router::{Route, RouteHop};
     use mockall::mock;
     use ntest::assert_true;
     use std::time::Duration;
@@ -2379,8 +2386,9 @@ mod tests {
         .unwrap();
 
         // We are altering the route to make sure that we fail at each hop in turn.
-        // We will assert that the failure index returned is the index of the hop that we altered.
         // This is done by setting the CLTV expiry delta to a value that will cause the payment to fail at that hop.
+        // A hop's CLTV expiry delta is checked against the policy of the *next* channel in the route, so altering
+        // hop i causes the channel at hop i + 1 to fail, and that is the index we expect to be reported.
         // The last hop will always succeed, so we only test the first n-1 hops.
         for i in 0..route.paths[0].hops.len() - 1 {
             let mut route_clone = route.clone();
@@ -2401,9 +2409,80 @@ mod tests {
 
             assert!(matches!(
                 result.payment_outcome,
-                PaymentOutcome::IndexFailure(idx) if idx == i
+                PaymentOutcome::IndexFailure(idx) if idx == i + 1
             ));
         }
+    }
+
+    #[tokio::test]
+    async fn test_payment_failure_updates_scorer_for_failing_channel() {
+        let chan_capacity = 500_000_000;
+        let amount_msat = 20_000;
+        let test_kit =
+            DispatchPaymentTestKit::new(chan_capacity, vec![], CustomRecords::default()).await;
+
+        let node = SimNode::new(
+            node_info(test_kit.nodes[0], String::default()),
+            Arc::new(Mutex::new(test_kit.graph)),
+            test_kit.routing_graph.clone(),
+            Arc::new(SimulationClock::new(SystemTime::now())),
+        )
+        .unwrap();
+
+        let mut route = build_route_from_hops(
+            &test_kit.nodes[0],
+            &[test_kit.nodes[1], test_kit.nodes[2], test_kit.nodes[3]],
+            &RouteParameters {
+                payment_params: PaymentParameters::from_node_id(*test_kit.nodes.last().unwrap(), 0)
+                    .with_max_total_cltv_expiry_delta(u32::MAX)
+                    .with_max_path_count(1)
+                    .with_max_channel_saturation_power_of_half(1),
+                final_value_msat: amount_msat,
+                max_total_routing_fee_msat: None,
+            },
+            &test_kit.routing_graph,
+            &WrappedLog {},
+            &[0; 32],
+        )
+        .unwrap();
+
+        // Break the CLTV delta on hop 1 so that the forward over the last channel (hop 2) fails.
+        // Note that the test kit's short channel ids are 0, 1, 2, so this also catches a hop index
+        // being passed to the scorer in place of a short channel id.
+        route.paths[0].hops[1].cltv_expiry_delta = 39;
+        let path = route.paths[0].clone();
+
+        let payment_hash = PaymentPreimage(rand::random()).into();
+        node.send_to_route(route, payment_hash, None).await.unwrap();
+
+        let (_, shutdown_listener) = triggered::trigger();
+        let result = node
+            .track_payment(&payment_hash, shutdown_listener)
+            .await
+            .unwrap();
+        assert!(matches!(
+            result.payment_outcome,
+            PaymentOutcome::IndexFailure(2)
+        ));
+
+        let scorer = node.scorer.read().unwrap();
+        let liquidity_range = |hop: &RouteHop| {
+            scorer
+                .estimated_channel_liquidity_range(
+                    hop.short_channel_id,
+                    &NodeId::from_pubkey(&hop.pubkey),
+                )
+                .unwrap()
+        };
+
+        // The channel before the failure carried the HTLC, so the scorer should have learned that it
+        // has at least the payment amount available.
+        let (min_before, _) = liquidity_range(&path.hops[1]);
+        assert!(min_before >= amount_msat);
+
+        // The failing channel should now be estimated to hold less than the amount we tried to send.
+        let (_, max_failed) = liquidity_range(&path.hops[2]);
+        assert!(max_failed <= amount_msat);
     }
 
     mock! {
@@ -2944,9 +3023,11 @@ mod tests {
             .send_test_payment(test_kit.nodes[0], test_kit.nodes[3], 150_000_000)
             .await;
 
+        // The interceptor on the first forwarding node (Bob) rejects the HTLC, so the channel that
+        // fails is Bob's outgoing channel at hop index 1.
         assert!(matches!(
             result.unwrap().payment_outcome,
-            PaymentOutcome::IndexFailure(0)
+            PaymentOutcome::IndexFailure(1)
         ));
 
         // The interceptor returned a forwarding error, check that a simulation shutdown has not
