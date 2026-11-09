@@ -38,6 +38,7 @@ pub mod eclair;
 pub mod latency_interceptor;
 pub mod ldk_server;
 pub mod lnd;
+pub mod probing;
 mod random_activity;
 #[cfg(feature = "virtual-time")]
 pub mod runtime;

@@ -21,7 +21,8 @@ use lightning::ln::msgs::{
 use lightning::routing::gossip::{NetworkGraph, NodeId};
 use lightning::routing::router::{find_route, Path, PaymentParameters, Route, RouteParameters};
 use lightning::routing::scoring::{
-    ProbabilisticScorer, ProbabilisticScoringDecayParameters, ScoreUpdate,
+    ProbabilisticScorer, ProbabilisticScoringDecayParameters, ProbabilisticScoringFeeParameters,
+    ScoreUpdate,
 };
 use lightning::routing::utxo::{UtxoLookup, UtxoResult};
 use lightning::types::features::{ChannelFeatures, NodeFeatures};
@@ -490,6 +491,55 @@ impl SimulatedChannel {
             node_info(self.node_2.policy.pubkey, self.node_2.policy.alias.clone()),
         )
     }
+
+    /// Returns a summary of this channel from the perspective of the node provided, including the limits on the next
+    /// HTLC that it could add to the channel. These limits mirror the checks in [`ChannelState::check_outgoing_addition`].
+    fn local_channel(&self, node: &PublicKey) -> Result<LocalChannel, CriticalError> {
+        let (local, remote) = if node == &self.node_1.policy.pubkey {
+            (&self.node_1, &self.node_2)
+        } else if node == &self.node_2.policy.pubkey {
+            (&self.node_2, &self.node_1)
+        } else {
+            return Err(CriticalError::NodeNotFound(*node));
+        };
+
+        let next_outbound_htlc_limit_msat =
+            if local.in_flight.len() as u64 >= remote.policy.max_htlc_count {
+                0
+            } else {
+                local
+                    .local_balance_msat
+                    .min(local.policy.max_htlc_size_msat)
+                    .min(
+                        remote
+                            .policy
+                            .max_in_flight_msat
+                            .saturating_sub(local.in_flight_total()),
+                    )
+            };
+
+        Ok(LocalChannel {
+            short_channel_id: self.short_channel_id.into(),
+            counterparty: remote.policy.pubkey,
+            next_outbound_htlc_limit_msat,
+            next_outbound_htlc_minimum_msat: local.policy.min_htlc_size_msat,
+        })
+    }
+}
+
+/// A summary of one of a node's own channels, from that node's perspective. This is the simulated equivalent of the
+/// fields of LDK's `ChannelDetails` that probing strategies use to decide what they can send.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalChannel {
+    /// The short channel id of the channel.
+    pub short_channel_id: u64,
+    /// The node on the other side of the channel.
+    pub counterparty: PublicKey,
+    /// The largest HTLC that the node could currently add to the channel, accounting for its balance, the maximum
+    /// HTLC size and the counterparty's in-flight limits.
+    pub next_outbound_htlc_limit_msat: u64,
+    /// The smallest HTLC that the node can add to the channel.
+    pub next_outbound_htlc_minimum_msat: u64,
 }
 
 /// SimNetwork represents a high level network coordinator that is responsible for the task of actually propagating
@@ -525,10 +575,12 @@ pub trait SimNetwork: Send + Sync {
     async fn lookup_node(&self, node: &PublicKey) -> Result<(NodeInfo, Vec<u64>), LightningError>;
     /// Lists all nodes in the simulated network.
     fn list_nodes(&self) -> Vec<NodeInfo>;
+    /// Lists the channels of the node provided, from that node's perspective, with their current outbound limits.
+    async fn local_channels(&self, node: &PublicKey) -> Result<Vec<LocalChannel>, LightningError>;
 }
 
-type LdkNetworkGraph = NetworkGraph<Arc<WrappedLog>>;
-type Scorer = ProbabilisticScorer<Arc<LdkNetworkGraph>, Arc<WrappedLog>>;
+pub(crate) type LdkNetworkGraph = NetworkGraph<Arc<WrappedLog>>;
+pub(crate) type Scorer = ProbabilisticScorer<Arc<LdkNetworkGraph>, Arc<WrappedLog>>;
 
 struct InFlightPayment {
     /// The channel used to report payment results to.
@@ -550,12 +602,12 @@ pub struct SimNode<T: SimNetwork, C: Clock> {
     /// Tracks the channel that will provide updates for payments by hash.
     in_flight: Mutex<HashMap<PaymentHash, InFlightPayment>>,
     /// A read-only graph used for pathfinding.
-    pathfinding_graph: Arc<LdkNetworkGraph>,
+    pub(crate) pathfinding_graph: Arc<LdkNetworkGraph>,
     /// Probabilistic scorer used to rank paths through the network for routing. This is reused across
     /// multiple payments to maintain scoring state.
-    scorer: Arc<std::sync::RwLock<Scorer>>,
+    pub(crate) scorer: Arc<std::sync::RwLock<Scorer>>,
     /// Clock for tracking simulation time.
-    clock: Arc<C>,
+    pub(crate) clock: Arc<C>,
 }
 
 impl<T: SimNetwork, C: Clock> SimNode<T, C> {
@@ -632,6 +684,15 @@ impl<T: SimNetwork, C: Clock> SimNode<T, C> {
         );
 
         Ok(())
+    }
+
+    /// Lists this node's channels with their current outbound limits.
+    pub async fn local_channels(&self) -> Result<Vec<LocalChannel>, LightningError> {
+        self.network
+            .lock()
+            .await
+            .local_channels(&self.info.pubkey)
+            .await
     }
 
     /// Sends a probe along the path provided, waits for it to resolve and updates this node's scorer with the result.
@@ -717,6 +778,26 @@ fn find_payment_route(
     pathfinding_graph: &LdkNetworkGraph,
     scorer: &Scorer,
 ) -> Result<Route, SimulationError> {
+    find_payment_route_with_params(
+        source,
+        dest,
+        amount_msat,
+        pathfinding_graph,
+        scorer,
+        &Default::default(),
+    )
+}
+
+/// Uses LDK's pathfinding algorithm to find a path from source to destination, scoring channels with the fee
+/// parameters provided (see [`find_payment_route`] for the remaining parameters used).
+pub(crate) fn find_payment_route_with_params(
+    source: &PublicKey,
+    dest: PublicKey,
+    amount_msat: u64,
+    pathfinding_graph: &LdkNetworkGraph,
+    scorer: &Scorer,
+    fee_params: &ProbabilisticScoringFeeParameters,
+) -> Result<Route, SimulationError> {
     find_route(
         source,
         &RouteParameters {
@@ -732,7 +813,7 @@ fn find_payment_route(
         None,
         &WrappedLog {},
         scorer,
-        &Default::default(),
+        fee_params,
         &[0; 32],
     )
     .map_err(|e| SimulationError::SimulatedNetworkError(e.to_string()))
@@ -1422,6 +1503,31 @@ impl SimNetwork for SimGraph {
             nodes.push(node.1 .0.clone());
         }
         nodes
+    }
+
+    /// local_channels lists the channels of the node provided, with their current outbound limits from that node's
+    /// perspective.
+    async fn local_channels(&self, node: &PublicKey) -> Result<Vec<LocalChannel>, LightningError> {
+        let scids = match self.nodes.get(node) {
+            Some(node_info) => &node_info.1,
+            None => {
+                return Err(LightningError::GetNodeInfoError(format!(
+                    "Node {} not found",
+                    node
+                )))
+            },
+        };
+
+        let channels = self.channels.lock().await;
+        scids
+            .iter()
+            .filter_map(|scid| channels.get(scid))
+            .map(|channel| {
+                channel
+                    .local_channel(node)
+                    .map_err(|e| LightningError::GetNodeInfoError(e.to_string()))
+            })
+            .collect()
     }
 }
 
@@ -2375,6 +2481,7 @@ mod tests {
 
             async fn lookup_node(&self, node: &PublicKey) -> Result<(NodeInfo, Vec<u64>), LightningError>;
             fn list_nodes(&self) -> Vec<NodeInfo>;
+            async fn local_channels(&self, node: &PublicKey) -> Result<Vec<LocalChannel>, LightningError>;
         }
     }
 
