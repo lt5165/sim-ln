@@ -597,6 +597,8 @@ pub struct SimulationCfg {
     total_time: Option<time::Duration>,
     /// The expected payment size for the network.
     expected_payment_msat: u64,
+    /// The minimum payment size for random activity: smaller amounts are redrawn. Zero means no minimum.
+    min_payment_msat: u64,
     /// The number of times that the network sends its total capacity in a month of operation when generating random
     /// activity.
     activity_multiplier: f64,
@@ -617,10 +619,18 @@ impl SimulationCfg {
         Self {
             total_time: total_time.map(|x| Duration::from_secs(x as u64)),
             expected_payment_msat,
+            min_payment_msat: 0,
             activity_multiplier,
             write_results,
             seed,
         }
+    }
+
+    /// Sets a minimum payment amount for random activity, below which drawn amounts are redrawn. See
+    /// [`RandomPaymentActivity::with_min_payment_amt`].
+    pub fn with_min_payment_msat(mut self, min_payment_msat: u64) -> Self {
+        self.min_payment_msat = min_payment_msat;
+        self
     }
 
     /// Returns the seed used for deterministic random number generation, if any.
@@ -1115,7 +1125,8 @@ impl<C: Clock + 'static> Simulation<C> {
                         self.cfg.activity_multiplier,
                         salted_rng,
                     )
-                    .map_err(SimulationError::RandomActivityError)?,
+                    .map_err(SimulationError::RandomActivityError)?
+                    .with_min_payment_amt(self.cfg.min_payment_msat),
                 ),
             });
         }

@@ -31,6 +31,10 @@ pub const DEFAULT_SIM_FILE: &str = "sim.json";
 /// The default expected payment amount for the simulation, around ~$10 at the time of writing.
 pub const DEFAULT_EXPECTED_PAYMENT_AMOUNT: u64 = 3_800_000;
 
+/// The default minimum payment amount for random activity (1 sat). Most channels require HTLCs of at least 1 sat, so
+/// smaller payments mostly fail to find a route.
+pub const DEFAULT_MIN_PAYMENT_AMOUNT: u64 = 1_000;
+
 /// The number of times over each node in the network sends its total deployed capacity in a calendar month.
 pub const DEFAULT_ACTIVITY_MULTIPLIER: f64 = 2.0;
 
@@ -76,6 +80,10 @@ pub struct Cli {
     /// Expected payment amount for the random activity generator
     #[clap(long, short, default_value_t = DEFAULT_EXPECTED_PAYMENT_AMOUNT, value_parser = clap::builder::RangedU64ValueParser::<u64>::new().range(1..u64::MAX))]
     pub expected_pmt_amt: u64,
+    /// Minimum payment amount for the random activity generator, in msat: smaller amounts are redrawn. Must be below
+    /// --expected-pmt-amt. Set to 0 for no minimum.
+    #[clap(long, default_value_t = DEFAULT_MIN_PAYMENT_AMOUNT)]
+    pub min_pmt_amt: u64,
     /// Multiplier of the overall network capacity used by the random activity generator
     #[clap(long, short, default_value_t = DEFAULT_ACTIVITY_MULTIPLIER, value_parser = clap::builder::StringValueParser::new().try_map(deserialize_f64_greater_than_zero))]
     pub capacity_multiplier: f64,
@@ -130,6 +138,14 @@ impl Cli {
                     "Virtual time requires --total-time, otherwise it advances forever"
                 ));
             }
+        }
+
+        if self.min_pmt_amt >= self.expected_pmt_amt {
+            return Err(anyhow!(
+                "Minimum payment amount ({}) must be below the expected payment amount ({})",
+                self.min_pmt_amt,
+                self.expected_pmt_amt
+            ));
         }
 
         if let Some(probing) = &sim_params.probing {
@@ -243,7 +259,8 @@ impl TryFrom<&Cli> for SimulationCfg {
                 None
             },
             cli.fix_seed,
-        ))
+        )
+        .with_min_payment_msat(cli.min_pmt_amt))
     }
 }
 
