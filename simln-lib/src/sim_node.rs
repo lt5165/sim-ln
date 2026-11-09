@@ -633,6 +633,66 @@ impl<T: SimNetwork, C: Clock> SimNode<T, C> {
 
         Ok(())
     }
+
+    /// Sends a probe along the path provided, waits for it to resolve and updates this node's scorer with the result.
+    /// This mirrors LDK's `ChannelManager::send_probe` combined with the handling of `Event::ProbeSuccessful` and
+    /// `Event::ProbeFailed` in LDK's background processor.
+    ///
+    /// Returns the outcome of the probe:
+    /// - [`PaymentOutcome::Success`]: the probe reached the final hop, so every channel on the path could carry it.
+    ///   This includes the case where the recipient rejected the HTLC (e.g. via an interceptor).
+    /// - [`PaymentOutcome::IndexFailure`]: the channel at the given hop index could not carry the probe.
+    ///
+    /// A failure on the first hop (our own channel) is returned, but not scored: we can observe our local channel
+    /// state directly, so LDK does not learn from such failures (and would refuse to send the probe in the first
+    /// place).
+    pub async fn probe(
+        &self,
+        path: Path,
+        listener: Listener,
+    ) -> Result<PaymentOutcome, LightningError> {
+        let (sender, receiver) = channel();
+        let payment_hash = PaymentHash(rand::random());
+        self.network.lock().await.dispatch_probe(
+            self.info.pubkey,
+            path.clone(),
+            payment_hash,
+            sender,
+        );
+
+        let result = select! {
+            biased;
+            _ = listener => return Err(LightningError::TrackPaymentError(
+                "shutdown during probe tracking".to_string(),
+            )),
+            res = receiver => res.map_err(|e| {
+                LightningError::TrackPaymentError(format!("probe channel receive err: {e}"))
+            })??,
+        };
+
+        let outcome = match result.payment_outcome {
+            // An index past the end of the path means that the probe reached the recipient, which rejected it.
+            PaymentOutcome::IndexFailure(index) if index >= path.hops.len() => {
+                PaymentOutcome::Success
+            },
+            outcome => outcome,
+        };
+
+        let duration = self.clock.now().duration_since(UNIX_EPOCH)?;
+        let mut scorer = self
+            .scorer
+            .write()
+            .map_err(|e| LightningError::TrackPaymentError(format!("scorer lock poisoned: {e}")))?;
+        match outcome {
+            PaymentOutcome::Success => scorer.probe_successful(&path, duration),
+            PaymentOutcome::IndexFailure(index) if index > 0 => {
+                scorer.probe_failed(&path, path.hops[index].short_channel_id, duration)
+            },
+            _ => {},
+        }
+
+        Ok(outcome)
+    }
 }
 
 /// Produces the node info for a mocked node, filling in the features that the simulator requires.
@@ -2544,6 +2604,84 @@ mod tests {
         // The failing channel should now be estimated to hold less than the amount we tried to send.
         let (_, max_failed) = liquidity_range(&path.hops[2]);
         assert!(max_failed <= amount_msat);
+    }
+
+    /// Tests that probes update the sending node's scorer in the same way that LDK handles probe events: a probe that
+    /// reaches its destination shows that every channel on the path had enough liquidity, a probe that fails partway
+    /// shows that the failing channel did not, and a failure on our own first hop is not scored.
+    #[tokio::test]
+    async fn test_probe_updates_scorer() {
+        let chan_capacity = 500_000_000;
+        let amount_msat = 20_000;
+        let test_kit =
+            DispatchPaymentTestKit::new(chan_capacity, vec![], CustomRecords::default()).await;
+        let graph = Arc::new(Mutex::new(test_kit.graph));
+
+        let node = SimNode::new(
+            node_info(test_kit.nodes[0], String::default()),
+            graph.clone(),
+            test_kit.routing_graph.clone(),
+            Arc::new(SimulationClock::new(SystemTime::now())),
+        )
+        .unwrap();
+
+        let path = find_payment_route(
+            &test_kit.nodes[0],
+            test_kit.nodes[3],
+            amount_msat,
+            &test_kit.routing_graph,
+            &test_kit.scorer,
+        )
+        .unwrap()
+        .paths[0]
+            .clone();
+        assert_eq!(path.hops.len(), 3);
+
+        let liquidity_range = |hop: &RouteHop| {
+            node.scorer
+                .read()
+                .unwrap()
+                .estimated_channel_liquidity_range(
+                    hop.short_channel_id,
+                    &NodeId::from_pubkey(&hop.pubkey),
+                )
+        };
+        let set_channel_balance = |scid: u64, balance: (u64, u64)| {
+            let graph = graph.clone();
+            async move {
+                let graph_lock = graph.lock().await;
+                let mut channels = graph_lock.channels.lock().await;
+                let channel = channels.get_mut(&ShortChannelID::from(scid)).unwrap();
+                channel.node_1.local_balance_msat = balance.0;
+                channel.node_2.local_balance_msat = balance.1;
+            }
+        };
+        let (_, listener) = triggered::trigger();
+
+        // A failure on our own first hop is returned, but tells the scorer nothing.
+        set_channel_balance(0, (0, chan_capacity)).await;
+        let outcome = node.probe(path.clone(), listener.clone()).await.unwrap();
+        assert_eq!(outcome, PaymentOutcome::IndexFailure(0));
+        assert!(path.hops.iter().all(|hop| liquidity_range(hop).is_none()));
+        set_channel_balance(0, (chan_capacity, 0)).await;
+
+        // A failure on the last channel should lower our estimate of its liquidity below the probed amount, and
+        // raise our estimate for the channels before it.
+        set_channel_balance(2, (0, chan_capacity)).await;
+        let outcome = node.probe(path.clone(), listener.clone()).await.unwrap();
+        assert_eq!(outcome, PaymentOutcome::IndexFailure(2));
+        assert!(liquidity_range(&path.hops[1]).unwrap().0 >= amount_msat);
+        assert!(liquidity_range(&path.hops[2]).unwrap().1 <= amount_msat);
+        set_channel_balance(2, (chan_capacity, 0)).await;
+
+        // A probe that reaches the destination shows that every channel had at least the probed amount, including
+        // the channel that previously failed.
+        let outcome = node.probe(path.clone(), listener.clone()).await.unwrap();
+        assert_eq!(outcome, PaymentOutcome::Success);
+        assert!(path
+            .hops
+            .iter()
+            .all(|hop| liquidity_range(hop).unwrap().0 >= amount_msat));
     }
 
     mock! {
