@@ -507,6 +507,20 @@ pub trait SimNetwork: Send + Sync {
         sender: Sender<Result<PaymentResult, LightningError>>,
     );
 
+    /// Sends a probe over the path provided, reporting the outcome to the sender channel provided. A probe is
+    /// propagated exactly like a payment, except that once it reaches the final hop its HTLCs are failed back rather
+    /// than settled (mimicking a probe in the real network, which uses a payment hash that the recipient cannot
+    /// settle). This means that a probe never moves balances, but it does lock liquidity while it is in flight.
+    ///
+    /// A probe that reached the final hop is reported as [`PaymentOutcome::Success`].
+    fn dispatch_probe(
+        &mut self,
+        source: PublicKey,
+        path: Path,
+        payment_hash: PaymentHash,
+        sender: Sender<Result<PaymentResult, LightningError>>,
+    );
+
     /// Looks up a node in the simulated network and a list of its channel capacities.
     async fn lookup_node(&self, node: &PublicKey) -> Result<(NodeInfo, Vec<u64>), LightningError>;
     /// Lists all nodes in the simulated network.
@@ -1281,6 +1295,40 @@ impl SimNetwork for SimGraph {
             interceptors: self.interceptors.clone(),
             custom_records: custom_records.unwrap_or(self.default_custom_records.clone()),
             shutdown_signal: self.shutdown_signal.clone(),
+            probe: false,
+        }));
+    }
+
+    /// dispatch_probe asynchronously propagates a probe through the simulated network. See
+    /// [`SimNetwork::dispatch_probe`] for details. [`SimGraph::default_custom_records`] will be sent with the probe.
+    fn dispatch_probe(
+        &mut self,
+        source: PublicKey,
+        path: Path,
+        payment_hash: PaymentHash,
+        sender: Sender<Result<PaymentResult, LightningError>>,
+    ) {
+        if path.hops.is_empty() {
+            if let Err(e) = sender.send(Ok(PaymentResult {
+                htlc_count: 0,
+                payment_outcome: PaymentOutcome::RouteNotFound,
+            })) {
+                log::error!("Could not send probe result: {:?}.", e);
+            }
+
+            return;
+        }
+
+        self.tasks.spawn(propagate_payment(PropagatePaymentRequest {
+            nodes: Arc::clone(&self.channels),
+            source,
+            route: path,
+            payment_hash,
+            sender,
+            interceptors: self.interceptors.clone(),
+            custom_records: self.default_custom_records.clone(),
+            shutdown_signal: self.shutdown_signal.clone(),
+            probe: true,
         }));
     }
 
@@ -1542,6 +1590,9 @@ struct PropagatePaymentRequest {
     interceptors: Vec<Arc<dyn Interceptor>>,
     custom_records: CustomRecords,
     shutdown_signal: (Trigger, Listener),
+    /// Whether this request is a probe, in which case HTLCs are failed back once they reach the final hop instead
+    /// of being settled.
+    probe: bool,
 }
 
 /// Finds a payment path from the source to destination nodes provided, and propagates the appropriate htlcs through
@@ -1561,14 +1612,16 @@ async fn propagate_payment(request: PropagatePaymentRequest) {
     .await
     {
         Ok(Ok(_)) => {
-            // If we successfully added the htlc, go ahead and remove all the htlcs in the route with successful resolution.
+            // If we successfully added the htlc, go ahead and remove all the htlcs in the route with successful
+            // resolution. Probes use a payment hash that the recipient can't settle, so in the real network they are
+            // failed back from the final hop: we mimic this by failing back the full route, leaving balances unchanged.
             if let Err(e) = remove_htlcs(
                 request.nodes,
                 request.route.hops.len() - 1,
                 request.source,
                 request.route,
                 request.payment_hash,
-                true,
+                !request.probe,
                 request.interceptors,
             )
             .await
@@ -2252,6 +2305,14 @@ mod tests {
                 sender: Sender<Result<PaymentResult, LightningError>>,
             );
 
+            fn dispatch_probe(
+                &mut self,
+                source: PublicKey,
+                path: Path,
+                payment_hash: PaymentHash,
+                sender: Sender<Result<PaymentResult, LightningError>>,
+            );
+
             async fn lookup_node(&self, node: &PublicKey) -> Result<(NodeInfo, Vec<u64>), LightningError>;
             fn list_nodes(&self) -> Vec<NodeInfo>;
         }
@@ -2615,6 +2676,31 @@ mod tests {
             (route, payment_result.unwrap().unwrap())
         }
 
+        // Sends a test probe from source to destination along the route that a payment of the same amount would take,
+        // waiting for the probe to resolve and returning the route used and the probe result.
+        async fn send_test_probe(
+            &mut self,
+            source: PublicKey,
+            dest: PublicKey,
+            amt: u64,
+        ) -> (Route, Result<PaymentResult, LightningError>) {
+            let route =
+                find_payment_route(&source, dest, amt, &self.routing_graph, &self.scorer).unwrap();
+
+            let (sender, receiver) = oneshot::channel();
+            self.graph.dispatch_probe(
+                source,
+                route.paths[0].clone(),
+                PaymentHash(rand::random()),
+                sender,
+            );
+
+            let probe_result = timeout(Duration::from_millis(10), receiver).await;
+            assert!(probe_result.is_ok());
+
+            (route, probe_result.unwrap().unwrap())
+        }
+
         // Sets the balance on the channel to the tuple provided, used to arrange liquidity for testing.
         async fn set_channel_balance(&mut self, scid: &ShortChannelID, balance: (u64, u64)) {
             let mut channels_lock = self.graph.channels.lock().await;
@@ -2688,6 +2774,59 @@ mod tests {
             .send_test_payment(test_kit.nodes[0], test_kit.nodes[3], 20_000)
             .await;
         assert_eq!(test_kit.channel_balances().await, expected_balances);
+
+        test_kit.shutdown.0.trigger();
+        test_kit.graph.tasks.close();
+        test_kit.graph.tasks.wait().await;
+    }
+
+    /// Tests that a probe that reaches its destination is reported as successful, but leaves channel balances
+    /// unchanged because its HTLCs are failed back rather than settled.
+    #[tokio::test]
+    async fn test_probe_reaching_destination_leaves_balances_unchanged() {
+        let chan_capacity = 500_000_000;
+        let mut test_kit =
+            DispatchPaymentTestKit::new(chan_capacity, vec![], CustomRecords::default()).await;
+        let starting_balances = test_kit.channel_balances().await;
+
+        let (_, result) = test_kit
+            .send_test_probe(test_kit.nodes[0], test_kit.nodes[3], 20_000)
+            .await;
+
+        assert!(matches!(
+            result.unwrap().payment_outcome,
+            PaymentOutcome::Success
+        ));
+        assert_eq!(test_kit.channel_balances().await, starting_balances);
+
+        test_kit.shutdown.0.trigger();
+        test_kit.graph.tasks.close();
+        test_kit.graph.tasks.wait().await;
+    }
+
+    /// Tests that a probe that fails partway along its path reports the index of the failing hop, and that the HTLCs
+    /// that it added before the failure are cleaned up.
+    #[tokio::test]
+    async fn test_probe_failure_reports_failing_hop() {
+        let chan_capacity = 500_000_000;
+        let mut test_kit =
+            DispatchPaymentTestKit::new(chan_capacity, vec![], CustomRecords::default()).await;
+
+        // Drain Carol's side of Carol -> Dave so that the probe fails on the last channel (hop index 2).
+        test_kit
+            .set_channel_balance(&ShortChannelID::from(2), (0, chan_capacity))
+            .await;
+        let starting_balances = test_kit.channel_balances().await;
+
+        let (_, result) = test_kit
+            .send_test_probe(test_kit.nodes[0], test_kit.nodes[3], 20_000)
+            .await;
+
+        assert!(matches!(
+            result.unwrap().payment_outcome,
+            PaymentOutcome::IndexFailure(2)
+        ));
+        assert_eq!(test_kit.channel_balances().await, starting_balances);
 
         test_kit.shutdown.0.trigger();
         test_kit.graph.tasks.close();
