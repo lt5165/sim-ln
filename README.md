@@ -321,6 +321,21 @@ The same directory also contains:
   and the largest HTLC it could actually send (`actual_sendable_msat`).
   Rows link to the events log by `probe_hash`.
 
+  LDK's scorer keeps two models of each channel, and the log records
+  both:
+  * Live bounds (`estimated_min_msat`, `estimated_max_msat`), which decay
+    with a 30 minute half-life.
+  * A historical model, which LDK's default routing penalties mostly use.
+    It is a histogram of where the bounds have been, which only decays
+    with time after 14 days without new data. `hist_min_buckets` and
+    `hist_max_buckets` are its 32 lower- and upper-bound bucket weights
+    (space separated, from the bottom of the channel's capacity to the
+    top; bucket widths are uneven and finer near the ends).
+
+  `live_success_prob` and `hist_success_prob` are each model's estimated
+  probability that the channel can carry `hop_amount_msat`, the amount
+  the probe sent over it (its final amount plus the fees of later hops).
+
 Run `sim-cli -h` for details on data directory (`--data-dir`) and other options including `--print-batch-size`
 which affect how simulation outputs are persisted
 

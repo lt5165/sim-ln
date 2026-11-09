@@ -759,6 +759,15 @@ impl<T: SimNetwork + 'static, C: Clock + 'static> Prober<T, C> {
     }
 }
 
+/// One channel's estimates from a node's scorer, read when a probe resolves.
+struct ScorerEstimate {
+    live_range: Option<(u64, u64)>,
+    live_success_prob: Option<f64>,
+    hist_success_prob: Option<f64>,
+    hist_min_buckets: Option<[u16; 32]>,
+    hist_max_buckets: Option<[u16; 32]>,
+}
+
 /// Writes a resolved probe to the event log, along with a row for each channel on its path that compares the probing
 /// node's (just updated) scorer estimate of the channel's liquidity with its actual balance.
 async fn record_probe<T: SimNetwork, C: Clock>(
@@ -771,23 +780,46 @@ async fn record_probe<T: SimNetwork, C: Clock>(
     event_log.log_probe(observer, path, probe)?;
 
     let time = node.clock.now();
-    let estimates: Vec<Option<(u64, u64)>> = {
+
+    // The amount sent over each hop's channel is the final amount plus the fees of the hops after it, which in LDK's
+    // path representation is the sum of fee_msat from that hop to the end of the path.
+    let hop_amounts: Vec<u64> = (0..path.hops.len())
+        .map(|i| path.hops[i..].iter().map(|h| h.fee_msat).sum())
+        .collect();
+
+    // Read every estimate under one scorer lock, so that all rows for this probe see the same scorer state.
+    let estimates: Vec<ScorerEstimate> = {
         let scorer = node.scorer.read().map_err(|e| {
             SimulationError::SimulatedNetworkError(format!("scorer lock poisoned: {e}"))
         })?;
+        let params = ProbabilisticScoringFeeParameters::default();
         path.hops
             .iter()
-            .map(|hop| {
-                scorer.estimated_channel_liquidity_range(
-                    hop.short_channel_id,
-                    &NodeId::from_pubkey(&hop.pubkey),
-                )
+            .zip(&hop_amounts)
+            .map(|(hop, amount)| {
+                let scid = hop.short_channel_id;
+                let target = NodeId::from_pubkey(&hop.pubkey);
+                let historical =
+                    scorer.historical_estimated_channel_liquidity_probabilities(scid, &target);
+                ScorerEstimate {
+                    live_range: scorer.estimated_channel_liquidity_range(scid, &target),
+                    live_success_prob: scorer.live_estimated_payment_success_probability(
+                        scid, &target, *amount, &params,
+                    ),
+                    hist_success_prob: scorer.historical_estimated_payment_success_probability(
+                        scid, &target, *amount, &params, false,
+                    ),
+                    hist_min_buckets: historical.map(|(min, _)| min),
+                    hist_max_buckets: historical.map(|(_, max)| max),
+                }
             })
             .collect()
     };
 
     let mut from_node = observer;
-    for (hop_index, (hop, estimate)) in path.hops.iter().zip(estimates).enumerate() {
+    for (hop_index, ((hop, estimate), hop_amount_msat)) in
+        path.hops.iter().zip(estimates).zip(hop_amounts).enumerate()
+    {
         let channel = node
             .network_channels(&from_node)
             .await?
@@ -810,10 +842,15 @@ async fn record_probe<T: SimNetwork, C: Clock>(
             from_node,
             to_node: hop.pubkey,
             capacity_msat: channel.capacity_msat,
-            estimated_min_msat: estimate.map(|(min, _)| min),
-            estimated_max_msat: estimate.map(|(_, max)| max),
+            hop_amount_msat,
+            estimated_min_msat: estimate.live_range.map(|(min, _)| min),
+            estimated_max_msat: estimate.live_range.map(|(_, max)| max),
             actual_balance_msat: channel.local_balance_msat,
             actual_sendable_msat: channel.next_outbound_htlc_limit_msat,
+            live_success_prob: estimate.live_success_prob,
+            hist_success_prob: estimate.hist_success_prob,
+            hist_min_buckets: estimate.hist_min_buckets,
+            hist_max_buckets: estimate.hist_max_buckets,
         })?;
 
         from_node = hop.pubkey;
@@ -1350,6 +1387,32 @@ mod tests {
             assert_eq!(
                 row[column("actual_balance_msat")],
                 (capacity / 2).to_string()
+            );
+
+            // Each hop carries the final amount plus the fees of the hops after it.
+            let hop_amount: u64 = path.hops[i..].iter().map(|h| h.fee_msat).sum();
+            assert_eq!(row[column("hop_amount_msat")], hop_amount.to_string());
+
+            // The probe succeeded, so the live bounds say the hop amount can be carried.
+            let live: f64 = row[column("live_success_prob")].parse().unwrap();
+            assert!(live > 0.99, "live success probability {live}");
+
+            // The probe added a data point to each channel's historical model: one bucket weight per bound.
+            for buckets in ["hist_min_buckets", "hist_max_buckets"] {
+                let weights: Vec<u16> = row[column(buckets)]
+                    .split(' ')
+                    .map(|w| w.parse().unwrap())
+                    .collect();
+                assert_eq!(weights.len(), 32);
+                assert!(weights.iter().any(|w| *w > 0), "{buckets}: {weights:?}");
+            }
+
+            // With a single data point, the historical model already gives a success probability, though it is more
+            // cautious than the live bounds.
+            let hist: f64 = row[column("hist_success_prob")].parse().unwrap();
+            assert!(
+                hist > 0.0 && hist <= live,
+                "historical success probability {hist}"
             );
         }
 

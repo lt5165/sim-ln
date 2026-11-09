@@ -111,17 +111,50 @@ pub struct ProbeBalanceRecord {
     pub to_node: PublicKey,
     /// The total capacity of the channel.
     pub capacity_msat: u64,
-    /// The scorer's lower bound on the liquidity available from `from_node` to `to_node`, or empty if the scorer has
-    /// no estimate for the channel.
+    /// The amount the probe sent over this channel: the probe's final amount plus the fees of the hops after it.
+    pub hop_amount_msat: u64,
+    /// The scorer's current (live) lower bound on the liquidity available from `from_node` to `to_node`, or empty if
+    /// the scorer has no estimate for the channel. Live bounds decay with LDK's 30 minute half-life.
     pub estimated_min_msat: Option<u64>,
-    /// The scorer's upper bound on the liquidity available from `from_node` to `to_node`, or empty if the scorer has
-    /// no estimate for the channel.
+    /// The scorer's current (live) upper bound on the liquidity available from `from_node` to `to_node`, or empty if
+    /// the scorer has no estimate for the channel.
     pub estimated_max_msat: Option<u64>,
     /// `from_node`'s actual balance in the channel, excluding outgoing HTLCs that are in flight.
     pub actual_balance_msat: u64,
     /// The largest HTLC that `from_node` could actually send over the channel, which also accounts for the maximum
     /// HTLC size and in-flight limits.
     pub actual_sendable_msat: u64,
+    /// The scorer's estimated probability that `hop_amount_msat` can be sent over the channel, from its live bounds.
+    pub live_success_prob: Option<f64>,
+    /// The scorer's estimated probability that `hop_amount_msat` can be sent over the channel, from its historical
+    /// model, which is what LDK's default routing penalties mostly use. Empty if the scorer has too little history
+    /// for the channel.
+    pub hist_success_prob: Option<f64>,
+    /// The scorer's historical model of the channel's lower liquidity bound: 32 space-separated bucket weights, from
+    /// the bottom of the channel's capacity to the top. Bucket widths are LDK-internal and uneven (finer near the
+    /// ends of the channel). Each update adds 32 to a bucket, and older weights fade as new data arrives.
+    #[serde(serialize_with = "serialize_buckets")]
+    pub hist_min_buckets: Option<[u16; 32]>,
+    /// The scorer's historical model of the channel's upper liquidity bound, in the same form as `hist_min_buckets`.
+    #[serde(serialize_with = "serialize_buckets")]
+    pub hist_max_buckets: Option<[u16; 32]>,
+}
+
+/// Writes historical buckets as a single space-separated field, or an empty field if there are none.
+fn serialize_buckets<S: serde::Serializer>(
+    buckets: &Option<[u16; 32]>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    match buckets {
+        Some(buckets) => serializer.serialize_str(
+            &buckets
+                .iter()
+                .map(|b| b.to_string())
+                .collect::<Vec<_>>()
+                .join(" "),
+        ),
+        None => serializer.serialize_str(""),
+    }
 }
 
 /// Writes an outcome in full (e.g. `IndexFailure(2)`). The CSV writer would otherwise write only the index for
