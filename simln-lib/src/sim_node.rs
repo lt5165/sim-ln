@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{hash_map::Entry, HashMap};
 use std::fmt::Display;
 use std::sync::Arc;
-use std::time::UNIX_EPOCH;
+use std::time::{Duration, UNIX_EPOCH};
 use tokio::task::JoinSet;
 use tokio_util::task::TaskTracker;
 
@@ -686,6 +686,19 @@ impl<T: SimNetwork, C: Clock> SimNode<T, C> {
         Ok(())
     }
 
+    /// Applies time-based decay to this node's scorer as of the current simulation time, so that what the scorer has
+    /// learned about channel liquidity fades with LDK's configured half-lives (30 minutes for liquidity bounds by
+    /// default). LDK's scorer only decays when this is called, so it must be called periodically: see
+    /// [`run_scorer_decay`].
+    pub fn decay_scorer(&self) -> Result<(), LightningError> {
+        let duration = self.clock.now().duration_since(UNIX_EPOCH)?;
+        self.scorer
+            .write()
+            .map_err(|e| LightningError::TrackPaymentError(format!("scorer lock poisoned: {e}")))?
+            .time_passed(duration);
+        Ok(())
+    }
+
     /// Lists this node's channels with their current outbound limits.
     pub async fn local_channels(&self) -> Result<Vec<LocalChannel>, LightningError> {
         self.network
@@ -1296,6 +1309,38 @@ impl SimGraph {
             default_custom_records,
             shutdown_signal,
         })
+    }
+}
+
+/// How often simulated nodes' scorers are decayed, in simulation time. Matches LDK's background processor, which calls
+/// `time_passed` on its scorer every time it persists it (every 5 minutes).
+pub const SCORER_DECAY_INTERVAL: Duration = Duration::from_secs(60 * 5);
+
+/// Periodically decays the scorers of the nodes provided until `listener` is triggered, mirroring LDK's background
+/// processor: the scorers are decayed once at startup and then every `interval`.
+///
+/// The interval is measured on the simulation clock, and the scorers measure their half-lives against the same clock.
+/// This means that decay follows LDK's half-lives in simulated time, which is also correct when the simulation runs
+/// on virtual time. Because the decay is exponential in the time elapsed since the scorer was last updated, the
+/// interval only controls how often the decay is applied, not how fast it happens.
+pub async fn run_scorer_decay<T: SimNetwork, C: Clock>(
+    nodes: Vec<Arc<SimNode<T, C>>>,
+    clock: Arc<C>,
+    interval: Duration,
+    listener: Listener,
+) {
+    loop {
+        for node in &nodes {
+            if let Err(e) = node.decay_scorer() {
+                log::error!("Could not decay scorer for {}: {e}", node.info.pubkey);
+            }
+        }
+
+        select! {
+            biased;
+            _ = listener.clone() => return,
+            _ = clock.sleep(interval) => {},
+        }
     }
 }
 
@@ -2789,6 +2834,90 @@ mod tests {
             .hops
             .iter()
             .all(|hop| liquidity_range(hop).unwrap().0 >= amount_msat));
+    }
+
+    /// Tests that running scorer decay on the simulation clock fades what the scorer has learned according to LDK's
+    /// liquidity half-life in simulated time. Runs on paused (virtual) time, so the half-life elapses instantly.
+    #[tokio::test(start_paused = true)]
+    async fn test_scorer_decays_with_simulation_time() {
+        let chan_capacity = 500_000_000;
+        let amount_msat = 20_000;
+        let mut test_kit =
+            DispatchPaymentTestKit::new(chan_capacity, vec![], CustomRecords::default()).await;
+
+        // Drain the last channel so that a probe fails there, teaching the scorer that it holds less than the amount.
+        test_kit
+            .set_channel_balance(&ShortChannelID::from(2), (0, chan_capacity))
+            .await;
+
+        let clock = Arc::new(SimulationClock::new(SystemTime::now()));
+        let node = Arc::new(
+            SimNode::new(
+                node_info(test_kit.nodes[0], String::default()),
+                Arc::new(Mutex::new(test_kit.graph)),
+                test_kit.routing_graph.clone(),
+                clock.clone(),
+            )
+            .unwrap(),
+        );
+
+        let path = find_payment_route(
+            &test_kit.nodes[0],
+            test_kit.nodes[3],
+            amount_msat,
+            &test_kit.routing_graph,
+            &test_kit.scorer,
+        )
+        .unwrap()
+        .paths[0]
+            .clone();
+        let (shutdown, listener) = triggered::trigger();
+        let outcome = node.probe(path.clone(), listener.clone()).await.unwrap();
+        assert_eq!(outcome, PaymentOutcome::IndexFailure(2));
+
+        // The scorer tracks the upper bound as an offset below the channel's effective capacity, which is what decays.
+        let failed_hop = &path.hops[2];
+        let target = NodeId::from_pubkey(&failed_hop.pubkey);
+        let effective_capacity = test_kit
+            .routing_graph
+            .read_only()
+            .channel(failed_hop.short_channel_id)
+            .unwrap()
+            .as_directed_to(&target)
+            .unwrap()
+            .0
+            .effective_capacity()
+            .as_msat();
+        let max_offset = || {
+            let (_, max) = node
+                .scorer
+                .read()
+                .unwrap()
+                .estimated_channel_liquidity_range(failed_hop.short_channel_id, &target)
+                .unwrap();
+            effective_capacity - max
+        };
+        let offset_before = max_offset();
+        assert!(offset_before > 0);
+
+        let decay = tokio::spawn(run_scorer_decay(
+            vec![node.clone()],
+            clock.clone(),
+            SCORER_DECAY_INTERVAL,
+            listener,
+        ));
+
+        // Without decay running, nothing would change. With it, after one default liquidity half-life (30 minutes of
+        // simulated time) the offset should have halved, allowing for rounding at each 5 minute decay step.
+        time::sleep(Duration::from_secs(30 * 60) + Duration::from_millis(1)).await;
+        let offset_after = max_offset();
+        assert!(
+            offset_after.abs_diff(offset_before / 2) <= 10,
+            "before: {offset_before}, after: {offset_after}"
+        );
+
+        shutdown.trigger();
+        decay.await.unwrap();
     }
 
     mock! {

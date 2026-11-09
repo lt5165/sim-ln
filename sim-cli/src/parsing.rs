@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 use simln_lib::clock::SimulationClock;
 use simln_lib::probing::{start_probing, ProbingConfig};
 use simln_lib::sim_node::{
-    ln_node_from_graph, populate_network_graph, ChannelPolicy, CustomRecords, Interceptor,
-    SimGraph, SimNode, SimulatedChannel,
+    ln_node_from_graph, populate_network_graph, run_scorer_decay, ChannelPolicy, CustomRecords,
+    Interceptor, SimGraph, SimNode, SimulatedChannel, SCORER_DECAY_INTERVAL,
 };
 use simln_lib::{
     cln, cln::ClnNode, eclair, eclair::EclairNode, ldk_server, ldk_server::LdkServerNode, lnd,
@@ -359,6 +359,15 @@ pub async fn create_simulation_with_network(
             shutdown_listener.clone(),
         )?;
     }
+
+    // Decay every node's scorer on the simulation clock, as LDK's background processor does, so that what nodes learn
+    // about channel liquidity fades over (simulated) time.
+    tasks.spawn(run_scorer_decay(
+        nodes.values().cloned().collect(),
+        clock.clone(),
+        SCORER_DECAY_INTERVAL,
+        shutdown_listener.clone(),
+    ));
 
     Ok((
         Simulation::new(

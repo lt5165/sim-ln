@@ -470,6 +470,9 @@ Included:
   count and value limitations set on channel creation.
 * Liquidity checks: HTLCs are only forwarded if the node has sufficient
   liquidity in the mocked channel.
+* Scorer decay: what each node's pathfinding scorer learns about channel
+  liquidity decays with LDK's default half-lives, measured in simulated
+  time (including when running on virtual time).
 
 Not included: 
 * Channel reserve: the required minimum reserve balance is not 
