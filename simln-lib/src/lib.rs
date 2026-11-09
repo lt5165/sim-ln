@@ -236,6 +236,9 @@ pub enum SimulationError {
     /// Error that occurred while building or driving the virtual-time runtime.
     #[error("Runtime Error: {0}")]
     RuntimeError(String),
+    /// Error in the configuration of background probing.
+    #[error("Probing Config Error: {0}")]
+    ProbingConfigError(String),
 }
 
 /// Represents errors that can occur during Lightning Network operations.
@@ -598,6 +601,11 @@ impl SimulationCfg {
             write_results,
             seed,
         }
+    }
+
+    /// Returns the seed used for deterministic random number generation, if any.
+    pub fn seed(&self) -> Option<u64> {
+        self.seed
     }
 }
 

@@ -411,6 +411,51 @@ This is required for the case where you want to specify a channel that
 will be used in the simulated network that is just responsible for 
 forwarding payments, but does not send or receive any payments itself.
 
+### Background Probing
+
+Simulated nodes can run background probing, which sends probes
+(payments that the recipient can't settle) to learn about the liquidity
+of channels in the network. Probe results train the node's pathfinding
+scorer, in the same way as LDK's background probing. Probes lock
+liquidity while they are in flight, but never move balances, and they
+are not included in the payment results.
+
+Probing is configured with an optional `probing` section:
+
+```
+{
+  "sim_network": [ ... ],
+  "probing": {
+    "strategy": { "high_degree": { "top_node_count": 100 } },
+    "nodes": [
+      "020a30431ce58843eedf8051214dbfadb65b107cc598b8277f14bb9b33c9cd026f"
+    ],
+    "interval_secs": 10,
+    "max_locked_msat": 100000000,
+    "min_amount_msat": 1000000,
+    "max_amount_msat": 10000000,
+    "cooldown_secs": 3600,
+    "diversity_penalty_msat": 250
+  }
+}
+```
+
+Two strategies are available, ported from LDK Node:
+* `high_degree` (`top_node_count`): probes towards the most-connected
+  nodes in the network, along the route that the node's scorer would
+  choose. Each target is skipped for `cooldown_secs` after it is probed.
+  `diversity_penalty_msat` penalizes recently probed channels when
+  choosing routes. Targets that are a single hop away are skipped.
+* `random_walk` (`max_hops`): probes along a random walk of 2 to
+  `max_hops` hops from one of the node's channels, which explores
+  channels the scorer would not choose.
+
+Only `strategy` is required. If `nodes` is empty or omitted, every node
+in `sim_network` probes. Each node sends at most one probe every
+`interval_secs`, with an amount chosen between `min_amount_msat` and
+`max_amount_msat`, and never has more than `max_locked_msat` locked in
+in-flight probes. When `--fix-seed` is set, probing is deterministic.
+
 ### Inclusions and Limitations
 
 The simulator will execute payments on the mocked out network as it 

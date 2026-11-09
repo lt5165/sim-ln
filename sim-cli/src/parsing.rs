@@ -4,6 +4,7 @@ use clap::{builder::TypedValueParser, Parser};
 use log::LevelFilter;
 use serde::{Deserialize, Serialize};
 use simln_lib::clock::SimulationClock;
+use simln_lib::probing::{start_probing, ProbingConfig};
 use simln_lib::sim_node::{
     ln_node_from_graph, populate_network_graph, ChannelPolicy, CustomRecords, Interceptor,
     SimGraph, SimNode, SimulatedChannel,
@@ -131,6 +132,15 @@ impl Cli {
             }
         }
 
+        if let Some(probing) = &sim_params.probing {
+            if sim_params.sim_network.is_empty() {
+                return Err(anyhow!(
+                    "Background probing is only allowed when running on a simulated network"
+                ));
+            }
+            probing.validate()?;
+        }
+
         if !sim_params.exclude.is_empty() {
             if sim_params.sim_network.is_empty() {
                 return Err(anyhow!(
@@ -160,6 +170,9 @@ pub struct SimParams {
     pub activity: Vec<ActivityParser>,
     #[serde(default)]
     pub exclude: Vec<PublicKey>,
+    /// Optional background probing configuration, only available on a simulated network.
+    #[serde(default)]
+    pub probing: Option<ProbingConfig>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -269,6 +282,7 @@ pub async fn create_simulation_with_network(
         sim_network,
         activity: _activity,
         exclude,
+        probing,
     } = sim_params;
 
     // Convert nodes representation for parsing to SimulatedChannel
@@ -333,6 +347,19 @@ pub async fn create_simulation_with_network(
     let validated_activities =
         get_validated_activities(&nodes_dyn, nodes_info, sim_params.activity.clone()).await?;
 
+    // Start background probing last, so that no probers are left running if setup fails. Probers run on the
+    // simulation's task tracker until it shuts down. Note that all nodes in the simulated network (including excluded
+    // nodes) can probe, because probing is separate from payment activity.
+    if let Some(probing) = probing {
+        start_probing(
+            probing,
+            &nodes,
+            cfg.seed(),
+            &tasks,
+            shutdown_listener.clone(),
+        )?;
+    }
+
     Ok((
         Simulation::new(
             cfg,
@@ -361,6 +388,7 @@ pub async fn create_simulation(
         sim_network: _sim_network,
         activity: _activity,
         exclude: _,
+        probing: _,
     } = sim_params;
 
     let (clients, clients_info) = get_clients(nodes.to_vec()).await?;

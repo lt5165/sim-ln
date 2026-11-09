@@ -22,6 +22,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, SystemTime};
 
@@ -33,10 +34,121 @@ use lightning::routing::scoring::ProbabilisticScoringFeeParameters;
 use lightning::types::features::{ChannelFeatures, NodeFeatures};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
+use serde::{Deserialize, Serialize};
+use tokio::select;
+use tokio_util::task::TaskTracker;
+use triggered::Listener;
 
 use crate::clock::Clock;
 use crate::sim_node::{find_payment_route_with_params, SimNetwork, SimNode};
-use crate::LightningNode;
+use crate::{LightningNode, PaymentOutcome, SimulationError};
+
+/// Default interval between probe attempts, in seconds. Matches LDK Node.
+pub const DEFAULT_PROBING_INTERVAL_SECS: u64 = 10;
+/// Default maximum amount that may be locked in a node's in-flight probes at any time. Matches LDK Node.
+pub const DEFAULT_MAX_PROBE_LOCKED_MSAT: u64 = 100_000_000;
+/// Default lower bound for randomly chosen probe amounts. Matches LDK Node.
+pub const DEFAULT_MIN_PROBE_AMOUNT_MSAT: u64 = 1_000_000;
+/// Default upper bound for randomly chosen probe amounts. Matches LDK Node.
+pub const DEFAULT_MAX_PROBE_AMOUNT_MSAT: u64 = 10_000_000;
+/// Default time that a node stays ineligible for [`HighDegreeStrategy`] after being probed. Matches LDK Node.
+pub const DEFAULT_PROBED_NODE_COOLDOWN_SECS: u64 = 60 * 60;
+
+/// Which built-in probing strategy to use, with its strategy-specific settings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProbingStrategyConfig {
+    /// Use [`HighDegreeStrategy`], cycling through the `top_node_count` most-connected nodes.
+    HighDegree { top_node_count: usize },
+    /// Use [`RandomWalkStrategy`], with paths of at most `max_hops` hops.
+    RandomWalk { max_hops: usize },
+}
+
+/// Configuration for background probing in a simulated network, read from the `probing` section of a simulation file.
+/// Every field other than `strategy` is optional, with defaults that match LDK Node.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProbingConfig {
+    /// The probing strategy to use.
+    pub strategy: ProbingStrategyConfig,
+    /// The nodes that run background probing. If empty, every node in the simulated network probes.
+    #[serde(default)]
+    pub nodes: Vec<PublicKey>,
+    /// The interval between probe attempts for each probing node.
+    #[serde(default = "default_interval_secs")]
+    pub interval_secs: u64,
+    /// The maximum amount that may be locked in each node's in-flight probes at any time.
+    #[serde(default = "default_max_locked_msat")]
+    pub max_locked_msat: u64,
+    /// The lower bound for randomly chosen probe amounts.
+    #[serde(default = "default_min_amount_msat")]
+    pub min_amount_msat: u64,
+    /// The upper bound for randomly chosen probe amounts.
+    #[serde(default = "default_max_amount_msat")]
+    pub max_amount_msat: u64,
+    /// How long a node stays ineligible after being probed. Only applies to [`HighDegreeStrategy`].
+    #[serde(default = "default_cooldown_secs")]
+    pub cooldown_secs: u64,
+    /// A penalty applied to recently probed channels when finding probe routes, which encourages path diversity. Only
+    /// applies to [`HighDegreeStrategy`]. If unset, no penalty is applied.
+    #[serde(default)]
+    pub diversity_penalty_msat: Option<u64>,
+}
+
+fn default_interval_secs() -> u64 {
+    DEFAULT_PROBING_INTERVAL_SECS
+}
+
+fn default_max_locked_msat() -> u64 {
+    DEFAULT_MAX_PROBE_LOCKED_MSAT
+}
+
+fn default_min_amount_msat() -> u64 {
+    DEFAULT_MIN_PROBE_AMOUNT_MSAT
+}
+
+fn default_max_amount_msat() -> u64 {
+    DEFAULT_MAX_PROBE_AMOUNT_MSAT
+}
+
+fn default_cooldown_secs() -> u64 {
+    DEFAULT_PROBED_NODE_COOLDOWN_SECS
+}
+
+impl ProbingConfig {
+    /// Creates a config for the strategy provided, with every other setting at its default.
+    pub fn new(strategy: ProbingStrategyConfig) -> Self {
+        Self {
+            strategy,
+            nodes: vec![],
+            interval_secs: DEFAULT_PROBING_INTERVAL_SECS,
+            max_locked_msat: DEFAULT_MAX_PROBE_LOCKED_MSAT,
+            min_amount_msat: DEFAULT_MIN_PROBE_AMOUNT_MSAT,
+            max_amount_msat: DEFAULT_MAX_PROBE_AMOUNT_MSAT,
+            cooldown_secs: DEFAULT_PROBED_NODE_COOLDOWN_SECS,
+            diversity_penalty_msat: None,
+        }
+    }
+
+    /// Validates that the config's values are usable.
+    pub fn validate(&self) -> Result<(), SimulationError> {
+        let err = |msg: &str| Err(SimulationError::ProbingConfigError(msg.to_string()));
+
+        if self.interval_secs == 0 {
+            return err("interval_secs must be at least 1");
+        }
+        if self.min_amount_msat == 0 {
+            return err("min_amount_msat must be greater than 0");
+        }
+        if self.min_amount_msat > self.max_amount_msat {
+            return err("min_amount_msat must not exceed max_amount_msat");
+        }
+        if let ProbingStrategyConfig::HighDegree { top_node_count: 0 } = self.strategy {
+            return err("top_node_count must be at least 1");
+        }
+
+        Ok(())
+    }
+}
 
 /// The CLTV expiry delta used for the final hop of probes that are built by hand. This matches the final CLTV delta
 /// used for payments in the simulated network.
@@ -487,6 +599,206 @@ impl<T: SimNetwork, C: Clock> ProbingStrategy for RandomWalkStrategy<T, C> {
     }
 }
 
+/// Counts of the probes sent by a [`Prober`].
+#[derive(Debug, Default)]
+pub struct ProbeStats {
+    /// Probes dispatched into the network.
+    pub sent: AtomicU64,
+    /// Probes that reached their destination.
+    pub reached_destination: AtomicU64,
+    /// Probes that failed before reaching their destination.
+    pub failed: AtomicU64,
+    /// Probes that were not sent because they would have exceeded the locked-liquidity budget.
+    pub skipped_over_budget: AtomicU64,
+}
+
+/// Periodically dispatches probes from a node according to a [`ProbingStrategy`]. This is a port of LDK Node's
+/// `Prober` and `run_prober`.
+pub struct Prober<T: SimNetwork, C: Clock> {
+    node: Arc<SimNode<T, C>>,
+    /// The strategy that decides what to probe.
+    strategy: Box<dyn ProbingStrategy>,
+    /// How often to fire a probe attempt.
+    interval: Duration,
+    /// Maximum total millisatoshis that may be locked in in-flight probes at any time.
+    max_locked_msat: u64,
+    /// Total millisatoshis currently locked in in-flight probes.
+    locked_msat: Arc<AtomicU64>,
+    stats: Arc<ProbeStats>,
+}
+
+impl<T: SimNetwork + 'static, C: Clock + 'static> Prober<T, C> {
+    /// Creates a prober for the node provided.
+    pub fn new(
+        node: Arc<SimNode<T, C>>,
+        strategy: Box<dyn ProbingStrategy>,
+        interval: Duration,
+        max_locked_msat: u64,
+    ) -> Self {
+        Self {
+            node,
+            strategy,
+            interval,
+            max_locked_msat,
+            locked_msat: Arc::new(AtomicU64::new(0)),
+            stats: Arc::new(ProbeStats::default()),
+        }
+    }
+
+    /// Returns the total millisatoshis currently locked in in-flight probes.
+    pub fn locked_msat(&self) -> u64 {
+        self.locked_msat.load(Ordering::SeqCst)
+    }
+
+    /// Returns the prober's probe counts, which can be read while the prober runs.
+    pub fn stats(&self) -> Arc<ProbeStats> {
+        self.stats.clone()
+    }
+
+    /// Runs the probing loop until `listener` is triggered. Each probe is tracked in its own task, spawned on `tasks`,
+    /// so that slow probes don't hold up the loop.
+    pub async fn run(self, tasks: TaskTracker, listener: Listener) {
+        let pubkey = self.node.get_info().pubkey;
+        log::info!(
+            "Starting background probing for {pubkey} every {:?}.",
+            self.interval
+        );
+
+        loop {
+            select! {
+                biased;
+                _ = listener.clone() => break,
+                _ = self.node.clock.sleep(self.interval) => {},
+            }
+
+            let path = match self.strategy.next_probe().await {
+                Some(path) => path,
+                None => continue,
+            };
+
+            let amount_msat: u64 = path.hops.iter().map(|h| h.fee_msat).sum();
+            if self.locked_msat() + amount_msat > self.max_locked_msat {
+                log::debug!("Skipping probe from {pubkey}: locked-msat budget exceeded.");
+                self.stats
+                    .skipped_over_budget
+                    .fetch_add(1, Ordering::SeqCst);
+                continue;
+            }
+
+            self.locked_msat.fetch_add(amount_msat, Ordering::SeqCst);
+            self.stats.sent.fetch_add(1, Ordering::SeqCst);
+            log::debug!(
+                "Background probe from {pubkey} sent: locked {amount_msat} msat, path: {}",
+                fmt_path(&path)
+            );
+
+            let node = self.node.clone();
+            let locked_msat = self.locked_msat.clone();
+            let stats = self.stats.clone();
+            let listener = listener.clone();
+            tasks.spawn(async move {
+                let result = node.probe(path.clone(), listener).await;
+                locked_msat.fetch_sub(amount_msat, Ordering::SeqCst);
+
+                match result {
+                    Ok(PaymentOutcome::Success) => {
+                        stats.reached_destination.fetch_add(1, Ordering::SeqCst);
+                        log::debug!(
+                            "Background probe from {pubkey} succeeded along the path: {}",
+                            fmt_path(&path)
+                        );
+                    },
+                    Ok(outcome) => {
+                        stats.failed.fetch_add(1, Ordering::SeqCst);
+                        log::debug!(
+                            "Background probe from {pubkey} failed with {outcome:?} along the path: {}",
+                            fmt_path(&path)
+                        );
+                    },
+                    Err(e) => log::debug!("Background probe from {pubkey} not resolved: {e}"),
+                }
+            });
+        }
+
+        log::info!(
+            "Stopped background probing for {pubkey}: {} probes sent, {} reached destination, {} failed, {} skipped \
+             over budget.",
+            self.stats.sent.load(Ordering::SeqCst),
+            self.stats.reached_destination.load(Ordering::SeqCst),
+            self.stats.failed.load(Ordering::SeqCst),
+            self.stats.skipped_over_budget.load(Ordering::SeqCst),
+        );
+    }
+}
+
+fn fmt_path(path: &Path) -> String {
+    path.hops
+        .iter()
+        .map(|h| format!("{}(scid={})", h.pubkey, h.short_channel_id))
+        .collect::<Vec<_>>()
+        .join(" -> ")
+}
+
+/// Starts background probing on the simulated nodes described in `config`, spawning a [`Prober`] for each on `tasks`.
+/// The probers run until `listener` is triggered. If `seed` is provided, probe selection is deterministic.
+pub fn start_probing<T: SimNetwork + 'static, C: Clock + 'static>(
+    config: &ProbingConfig,
+    nodes: &HashMap<PublicKey, Arc<SimNode<T, C>>>,
+    seed: Option<u64>,
+    tasks: &TaskTracker,
+    listener: Listener,
+) -> Result<(), SimulationError> {
+    config.validate()?;
+
+    let probing_nodes: Vec<PublicKey> = if config.nodes.is_empty() {
+        let mut all: Vec<PublicKey> = nodes.keys().copied().collect();
+        all.sort();
+        all
+    } else {
+        config.nodes.clone()
+    };
+
+    for pubkey in probing_nodes {
+        let node = nodes.get(&pubkey).ok_or_else(|| {
+            SimulationError::ProbingConfigError(format!(
+                "probing node {pubkey} not found in simulated network"
+            ))
+        })?;
+
+        let strategy: Box<dyn ProbingStrategy> = match config.strategy {
+            ProbingStrategyConfig::HighDegree { top_node_count } => {
+                Box::new(HighDegreeStrategy::new(
+                    node.clone(),
+                    top_node_count,
+                    config.min_amount_msat,
+                    config.max_amount_msat,
+                    Duration::from_secs(config.cooldown_secs),
+                    DEFAULT_LIQUIDITY_LIMIT_MULTIPLIER,
+                    config.diversity_penalty_msat,
+                    seed,
+                ))
+            },
+            ProbingStrategyConfig::RandomWalk { max_hops } => Box::new(RandomWalkStrategy::new(
+                node.clone(),
+                max_hops,
+                config.min_amount_msat,
+                config.max_amount_msat,
+                seed,
+            )),
+        };
+
+        let prober = Prober::new(
+            node.clone(),
+            strategy,
+            Duration::from_secs(config.interval_secs),
+            config.max_locked_msat,
+        );
+        tasks.spawn(prober.run(tasks.clone(), listener.clone()));
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -729,6 +1041,147 @@ mod tests {
         );
         let path = strategy.next_probe().await.unwrap();
         assert_eq!(scids(&path), vec![0, 1]);
+
+        network.shutdown().await;
+    }
+
+    /// Tests that the prober sends one probe per interval, trains the node's scorer and releases its locked liquidity
+    /// once probes resolve. Runs on paused (virtual) time, so the interval elapses instantly.
+    #[tokio::test(start_paused = true)]
+    async fn test_prober_sends_probes_on_interval() {
+        let network = TestNetwork::new(4, &[(0, 1), (1, 2), (2, 3)], 500_000_000).await;
+        let node = network.node(0);
+        let strategy = RandomWalkStrategy::new(node.clone(), 3, 10_000, 100_000, Some(5));
+        let prober = Prober::new(
+            node.clone(),
+            Box::new(strategy),
+            Duration::from_secs(10),
+            DEFAULT_MAX_PROBE_LOCKED_MSAT,
+        );
+        let stats = prober.stats();
+        let locked_msat = prober.locked_msat.clone();
+        network
+            .tasks
+            .spawn(prober.run(network.tasks.clone(), network.shutdown.1.clone()));
+
+        // Probes fire at 10s, 20s, ..., 100s.
+        tokio::time::sleep(Duration::from_secs(105)).await;
+        assert_eq!(stats.sent.load(Ordering::SeqCst), 10);
+        assert_eq!(stats.reached_destination.load(Ordering::SeqCst), 10);
+        assert_eq!(stats.failed.load(Ordering::SeqCst), 0);
+        assert_eq!(locked_msat.load(Ordering::SeqCst), 0);
+
+        // Every probe crosses B -- C, so the scorer should have learned that it has at least the minimum probe amount.
+        let (min_liquidity, _) = node
+            .scorer
+            .read()
+            .unwrap()
+            .estimated_channel_liquidity_range(1, &NodeId::from_pubkey(&network.pubkeys[2]))
+            .unwrap();
+        assert!(min_liquidity >= 10_000);
+
+        network.shutdown().await;
+    }
+
+    /// Tests that the prober does not send probes that would exceed its locked-liquidity budget.
+    #[tokio::test(start_paused = true)]
+    async fn test_prober_respects_locked_budget() {
+        let network = TestNetwork::new(4, &[(0, 1), (1, 2), (2, 3)], 500_000_000).await;
+        let node = network.node(0);
+        let strategy = RandomWalkStrategy::new(node.clone(), 3, 10_000, 100_000, Some(5));
+        let prober = Prober::new(node, Box::new(strategy), Duration::from_secs(10), 1_000);
+        let stats = prober.stats();
+        network
+            .tasks
+            .spawn(prober.run(network.tasks.clone(), network.shutdown.1.clone()));
+
+        tokio::time::sleep(Duration::from_secs(35)).await;
+        assert_eq!(stats.sent.load(Ordering::SeqCst), 0);
+        assert_eq!(stats.skipped_over_budget.load(Ordering::SeqCst), 3);
+
+        network.shutdown().await;
+    }
+
+    /// Tests parsing of the probing section of a simulation file, including defaults.
+    #[test]
+    fn test_probing_config_parsing() {
+        let config: ProbingConfig =
+            serde_json::from_str(r#"{"strategy": {"random_walk": {"max_hops": 4}}}"#).unwrap();
+        assert_eq!(
+            config,
+            ProbingConfig::new(ProbingStrategyConfig::RandomWalk { max_hops: 4 })
+        );
+        assert!(config.validate().is_ok());
+
+        let config: ProbingConfig = serde_json::from_str(
+            r#"{
+                "strategy": {"high_degree": {"top_node_count": 50}},
+                "nodes": ["0277622bf4c497475960bf91bd3c673a4cb4e9b589cebfde9700c197b3989cc1b8"],
+                "interval_secs": 30,
+                "max_locked_msat": 5000000,
+                "min_amount_msat": 1000,
+                "max_amount_msat": 2000,
+                "cooldown_secs": 600,
+                "diversity_penalty_msat": 250
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.strategy,
+            ProbingStrategyConfig::HighDegree { top_node_count: 50 }
+        );
+        assert_eq!(config.nodes.len(), 1);
+        assert_eq!(config.interval_secs, 30);
+        assert_eq!(config.max_locked_msat, 5_000_000);
+        assert_eq!(
+            (config.min_amount_msat, config.max_amount_msat),
+            (1000, 2000)
+        );
+        assert_eq!(config.cooldown_secs, 600);
+        assert_eq!(config.diversity_penalty_msat, Some(250));
+        assert!(config.validate().is_ok());
+
+        // A missing strategy is an error.
+        assert!(serde_json::from_str::<ProbingConfig>(r#"{"interval_secs": 30}"#).is_err());
+    }
+
+    /// Tests that invalid probing configs are rejected.
+    #[test]
+    fn test_probing_config_validation() {
+        let valid = ProbingConfig::new(ProbingStrategyConfig::HighDegree { top_node_count: 10 });
+
+        let mut config = valid.clone();
+        config.interval_secs = 0;
+        assert!(config.validate().is_err());
+
+        let mut config = valid.clone();
+        config.min_amount_msat = 0;
+        assert!(config.validate().is_err());
+
+        let mut config = valid.clone();
+        config.min_amount_msat = config.max_amount_msat + 1;
+        assert!(config.validate().is_err());
+
+        let mut config = valid.clone();
+        config.strategy = ProbingStrategyConfig::HighDegree { top_node_count: 0 };
+        assert!(config.validate().is_err());
+    }
+
+    /// Tests that probing can't be started on a node that isn't in the simulated network.
+    #[tokio::test]
+    async fn test_start_probing_rejects_unknown_node() {
+        let network = TestNetwork::new(2, &[(0, 1)], 500_000_000).await;
+
+        let mut config = ProbingConfig::new(ProbingStrategyConfig::RandomWalk { max_hops: 3 });
+        config.nodes = vec![get_random_keypair().1];
+        assert!(start_probing(
+            &config,
+            &network.nodes,
+            None,
+            &network.tasks,
+            network.shutdown.1.clone()
+        )
+        .is_err());
 
         network.shutdown().await;
     }
