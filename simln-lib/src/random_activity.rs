@@ -12,6 +12,9 @@ use crate::{
 };
 
 const HOURS_PER_MONTH: u64 = 30 * 24;
+
+/// The maximum number of times a payment amount is redrawn to meet the minimum payment amount before giving up.
+const MAX_AMOUNT_DRAWS: u32 = 100_000;
 const SECONDS_PER_MONTH: u64 = HOURS_PER_MONTH * 60 * 60;
 
 #[derive(Debug, Error)]
@@ -124,6 +127,8 @@ impl Display for NetworkGraphView {
 pub struct RandomPaymentActivity {
     multiplier: f64,
     expected_payment_amt: u64,
+    /// Payment amounts below this value are redrawn. Zero means no minimum.
+    min_payment_amt: u64,
     source_capacity: u64,
     event_dist: Exp<f64>,
     rng: MutRng,
@@ -171,10 +176,22 @@ impl RandomPaymentActivity {
         Ok(RandomPaymentActivity {
             multiplier,
             expected_payment_amt,
+            min_payment_amt: 0,
             source_capacity: source_capacity_msat,
             event_dist,
             rng,
         })
+    }
+
+    /// Sets a minimum payment amount: amounts drawn below it are redrawn, which truncates the bottom of the payment
+    /// amount distribution without changing its shape above the minimum. Without a minimum, the log-normal
+    /// distribution can produce many tiny (even sub-satoshi) payments when node capacity is large relative to the
+    /// expected payment amount, because its median is `expected^2 / limit`.
+    ///
+    /// The minimum should be below the expected payment amount, so that amounts above it are likely to be drawn.
+    pub fn with_min_payment_amt(mut self, min_payment_amt: u64) -> Self {
+        self.min_payment_amt = min_payment_amt;
+        self
     }
 
     /// Validates that the generator will be able to generate payment amounts based on the node's capacity and the
@@ -282,9 +299,21 @@ impl PaymentGenerator for RandomPaymentActivity {
             .0
             .lock()
             .map_err(|e| PaymentGenerationError(e.to_string()))?;
-        let payment_amount = log_normal.sample(&mut *rng) as u64;
 
-        Ok(payment_amount)
+        // Redraw amounts below the minimum. Without a minimum, the first draw is always used, so the sequence of
+        // random numbers (and seeded results) is unchanged.
+        for _ in 0..MAX_AMOUNT_DRAWS {
+            let payment_amount = log_normal.sample(&mut *rng) as u64;
+            if payment_amount >= self.min_payment_amt {
+                return Ok(payment_amount);
+            }
+        }
+
+        Err(PaymentGenerationError(format!(
+            "could not draw a payment amount of at least {} msat in {MAX_AMOUNT_DRAWS} attempts (expected amount: {}, \
+             payment limit: {payment_limit})",
+            self.min_payment_amt, self.expected_payment_amt
+        )))
     }
 }
 
@@ -487,6 +516,69 @@ mod tests {
 
             assert!(matches!(
                 pag.payment_amount(None),
+                Err(PaymentGenerationError(..))
+            ));
+        }
+
+        /// Tests that a minimum payment amount removes small amounts by redrawing them. The capacities are large
+        /// relative to the expected amount, which makes the distribution very skewed (its median is
+        /// `expected^2 / limit`, here 1 msat), as with large nodes in real network snapshots.
+        #[test]
+        fn test_payment_amount_with_minimum() {
+            let expected_payment = 1_000_000;
+            let capacity = 2_000_000_000_000;
+            let min_payment = 1_000;
+            let seed = Some((42, None));
+
+            let unbounded =
+                RandomPaymentActivity::new(capacity, expected_payment, 1.0, MutRng::new(seed))
+                    .unwrap();
+            let amounts: Vec<u64> = (0..10_000)
+                .map(|_| unbounded.payment_amount(Some(capacity)).unwrap())
+                .collect();
+            let below = amounts.iter().filter(|a| **a < min_payment).count();
+            assert!(
+                below > 1_000,
+                "expected many small amounts without a minimum, got {below}"
+            );
+
+            let bounded =
+                RandomPaymentActivity::new(capacity, expected_payment, 1.0, MutRng::new(seed))
+                    .unwrap()
+                    .with_min_payment_amt(min_payment);
+            for _ in 0..10_000 {
+                assert!(bounded.payment_amount(Some(capacity)).unwrap() >= min_payment);
+            }
+        }
+
+        /// Tests that a minimum of zero leaves seeded payment amounts exactly as they were without a minimum.
+        #[test]
+        fn test_zero_minimum_keeps_seeded_amounts() {
+            let seed = Some((7, None));
+            let without =
+                RandomPaymentActivity::new(1_000_000_000, 1_000, 1.0, MutRng::new(seed)).unwrap();
+            let with_zero =
+                RandomPaymentActivity::new(1_000_000_000, 1_000, 1.0, MutRng::new(seed))
+                    .unwrap()
+                    .with_min_payment_amt(0);
+
+            for _ in 0..1_000 {
+                assert_eq!(
+                    without.payment_amount(Some(1_000_000_000)).unwrap(),
+                    with_zero.payment_amount(Some(1_000_000_000)).unwrap()
+                );
+            }
+        }
+
+        /// Tests that an unreachable minimum returns an error rather than looping forever.
+        #[test]
+        fn test_unreachable_minimum_errors() {
+            let pag = RandomPaymentActivity::new(4_000, 1_000, 1.0, MutRng::new(Some((1, None))))
+                .unwrap()
+                .with_min_payment_amt(u64::MAX);
+
+            assert!(matches!(
+                pag.payment_amount(Some(4_000)),
                 Err(PaymentGenerationError(..))
             ));
         }

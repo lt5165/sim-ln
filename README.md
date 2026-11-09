@@ -169,9 +169,19 @@ match the public key reported by the node.
 
 There are a few cli flags that can be used to toggle the characteristics 
 of the random activity that is generated: 
-* `--expected-payment-amount`: the approximate average amount that 
+* `--expected-pmt-amt`: the approximate average amount that 
   will be sent by nodes, randomness will be introduced such that larger
   nodes send a wider variety of payment sizes around this expectation.
+* `--min-pmt-amt`: the minimum payment amount in msat (default 1000,
+  i.e. 1 sat). Payment amounts below it are redrawn. Without a minimum,
+  large nodes produce many tiny payments (the median of the amount
+  distribution is `expected^2 / limit`, where `limit` is half the
+  smaller node's capacity), and payments below most channels' 1 sat
+  minimum HTLC mostly fail to find a route. Set to 0 for no minimum.
+  Note that redrawing raises the average payment amount, and so the
+  volume each node sends, by a factor of one over the share of draws
+  that meet the minimum: if half of draws fall below it, the average
+  amount roughly doubles.
 * `--capacity-multiplier`: the number of times over that each node in 
   the network sends their capacity in a calendar month, for example:
   * `capacity-multiplier=2` means that each node sends double their 
