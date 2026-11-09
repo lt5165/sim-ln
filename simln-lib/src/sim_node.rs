@@ -1,6 +1,7 @@
 use crate::clock::Clock;
 use crate::{
-    Graph, LightningError, LightningNode, NodeInfo, PaymentOutcome, PaymentResult, SimulationError,
+    FailureDetails, Graph, LightningError, LightningNode, NodeInfo, PaymentOutcome, PaymentResult,
+    SimulationError,
 };
 use async_trait::async_trait;
 use bitcoin::constants::ChainHash;
@@ -11,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{hash_map::Entry, HashMap};
 use std::fmt::Display;
 use std::sync::Arc;
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::task::JoinSet;
 use tokio_util::task::TaskTracker;
 
@@ -55,7 +56,7 @@ pub enum ForwardingError {
     ExceedsInFlightCount(u64, u64),
     /// The forwarded htlc's amount would push the channel over its maximum allowable in flight total
     /// (total in flight / maximum).
-    #[error("ExceedsInFlightTotal: total in flight amount: {0} > maximum amount: {0}")]
+    #[error("ExceedsInFlightTotal: total in flight amount: {0} > maximum amount: {1}")]
     ExceedsInFlightTotal(u64, u64),
     /// The forwarded htlc's cltv expiry exceeds the maximum value used to express block heights in Bitcoin.
     #[error("ExpiryInSeconds: cltv expressed in seconds: {0}")]
@@ -69,6 +70,23 @@ pub enum ForwardingError {
     /// Custom error for interceptors if encountered a forwarding error during htlc interception.
     #[error("InterceptorError: {0}")]
     InterceptorError(String),
+}
+
+impl ForwardingError {
+    /// Returns the name of the kind of forwarding error, without the values that caused it.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            ForwardingError::InsufficientBalance(..) => "InsufficientBalance",
+            ForwardingError::LessThanMinimum(..) => "LessThanMinimum",
+            ForwardingError::MoreThanMaximum(..) => "MoreThanMaximum",
+            ForwardingError::ExceedsInFlightCount(..) => "ExceedsInFlightCount",
+            ForwardingError::ExceedsInFlightTotal(..) => "ExceedsInFlightTotal",
+            ForwardingError::ExpiryInSeconds(..) => "ExpiryInSeconds",
+            ForwardingError::InsufficientCltvDelta(..) => "InsufficientCltvDelta",
+            ForwardingError::InsufficientFee(..) => "InsufficientFee",
+            ForwardingError::InterceptorError(..) => "InterceptorError",
+        }
+    }
 }
 
 /// CriticalError represents an error while propagating a payment in a simulated network that
@@ -521,6 +539,8 @@ impl SimulatedChannel {
         Ok(LocalChannel {
             short_channel_id: self.short_channel_id.into(),
             counterparty: remote.policy.pubkey,
+            capacity_msat: self.capacity_msat,
+            local_balance_msat: local.local_balance_msat,
             next_outbound_htlc_limit_msat,
             next_outbound_htlc_minimum_msat: local.policy.min_htlc_size_msat,
         })
@@ -535,6 +555,10 @@ pub struct LocalChannel {
     pub short_channel_id: u64,
     /// The node on the other side of the channel.
     pub counterparty: PublicKey,
+    /// The total capacity of the channel.
+    pub capacity_msat: u64,
+    /// The node's current balance in the channel, excluding outgoing HTLCs that are in flight.
+    pub local_balance_msat: u64,
     /// The largest HTLC that the node could currently add to the channel, accounting for its balance, the maximum
     /// HTLC size and the counterparty's in-flight limits.
     pub next_outbound_htlc_limit_msat: u64,
@@ -701,11 +725,17 @@ impl<T: SimNetwork, C: Clock> SimNode<T, C> {
 
     /// Lists this node's channels with their current outbound limits.
     pub async fn local_channels(&self) -> Result<Vec<LocalChannel>, LightningError> {
-        self.network
-            .lock()
-            .await
-            .local_channels(&self.info.pubkey)
-            .await
+        self.network_channels(&self.info.pubkey).await
+    }
+
+    /// Lists the channels of any node in the simulated network, with their actual current state from that node's
+    /// perspective. This reads the simulation's internal state, so it is only for analysis (e.g. comparing a scorer's
+    /// estimates with actual balances), not for decisions a real node could make.
+    pub async fn network_channels(
+        &self,
+        node: &PublicKey,
+    ) -> Result<Vec<LocalChannel>, LightningError> {
+        self.network.lock().await.local_channels(node).await
     }
 
     /// Sends a probe along the path provided, waits for it to resolve and updates this node's scorer with the result.
@@ -724,9 +754,10 @@ impl<T: SimNetwork, C: Clock> SimNode<T, C> {
         &self,
         path: Path,
         listener: Listener,
-    ) -> Result<PaymentOutcome, LightningError> {
+    ) -> Result<ProbeResult, LightningError> {
         let (sender, receiver) = channel();
         let payment_hash = PaymentHash(rand::random());
+        let dispatch_time = self.clock.now();
         self.network.lock().await.dispatch_probe(
             self.info.pubkey,
             path.clone(),
@@ -744,13 +775,14 @@ impl<T: SimNetwork, C: Clock> SimNode<T, C> {
             })??,
         };
 
-        let outcome = match result.payment_outcome {
+        let mut result = result;
+        if let PaymentOutcome::IndexFailure(index) = result.payment_outcome {
             // An index past the end of the path means that the probe reached the recipient, which rejected it.
-            PaymentOutcome::IndexFailure(index) if index >= path.hops.len() => {
-                PaymentOutcome::Success
-            },
-            outcome => outcome,
-        };
+            if index >= path.hops.len() {
+                result.payment_outcome = PaymentOutcome::Success;
+            }
+        }
+        let outcome = result.payment_outcome.clone();
 
         let duration = self.clock.now().duration_since(UNIX_EPOCH)?;
         let mut scorer = self
@@ -765,8 +797,24 @@ impl<T: SimNetwork, C: Clock> SimNode<T, C> {
             _ => {},
         }
 
-        Ok(outcome)
+        Ok(ProbeResult {
+            payment_hash,
+            dispatch_time,
+            result,
+        })
     }
+}
+
+/// The result of a probe sent with [`SimNode::probe`].
+#[derive(Debug, Clone)]
+pub struct ProbeResult {
+    /// The (unsettleable) payment hash used for the probe.
+    pub payment_hash: PaymentHash,
+    /// The simulation time at which the probe was dispatched.
+    pub dispatch_time: SystemTime,
+    /// The outcome of the probe: [`PaymentOutcome::Success`] if it reached the final hop, otherwise
+    /// [`PaymentOutcome::IndexFailure`] with details of the failure.
+    pub result: PaymentResult,
 }
 
 /// Produces the node info for a mocked node, filling in the features that the simulator requires.
@@ -904,6 +952,7 @@ impl<T: SimNetwork, C: Clock> LightningNode for SimNode<T, C> {
                 if let Err(e) = sender.send(Ok(PaymentResult {
                     htlc_count: 0,
                     payment_outcome: PaymentOutcome::RouteNotFound,
+                    failure: None,
                 })) {
                     log::error!("Could not send payment result: {:?}.", e);
                 }
@@ -1464,6 +1513,7 @@ impl SimNetwork for SimGraph {
                 if let Err(e) = sender.send(Ok(PaymentResult {
                     htlc_count: 0,
                     payment_outcome: PaymentOutcome::RouteNotFound,
+                    failure: None,
                 })) {
                     log::error!("Could not send payment result: {:?}.", e);
                 }
@@ -1498,6 +1548,7 @@ impl SimNetwork for SimGraph {
             if let Err(e) = sender.send(Ok(PaymentResult {
                 htlc_count: 0,
                 payment_outcome: PaymentOutcome::RouteNotFound,
+                failure: None,
             })) {
                 log::error!("Could not send probe result: {:?}.", e);
             }
@@ -1843,11 +1894,26 @@ async fn propagate_payment(request: PropagatePaymentRequest) {
             PaymentResult {
                 htlc_count: 1,
                 payment_outcome: PaymentOutcome::Success,
+                failure: None,
             }
         },
         Ok(Err((fail_idx, fwd_err))) => {
             // If we partially added HTLCs along the route, we need to fail them back to the source to clean up our partial
             // state. It's possible that we failed with the very first add, and then we don't need to clean anything up.
+            // fail_idx is the index of the last hop whose channel successfully added the HTLC (None if the very
+            // first add failed), so the channel that failed is the one at the following hop. If there is no following
+            // hop, the HTLC reached the recipient and was rejected there.
+            let failed_index = fail_idx.map_or(0, |i| i + 1);
+            let failure = FailureDetails {
+                failed_scid: request
+                    .route
+                    .hops
+                    .get(failed_index)
+                    .map(|hop| hop.short_channel_id),
+                reason: fwd_err.kind().to_string(),
+                detail: fwd_err.to_string(),
+            };
+
             if let Some(resolution_idx) = fail_idx {
                 if remove_htlcs(
                     request.nodes,
@@ -1869,11 +1935,10 @@ async fn propagate_payment(request: PropagatePaymentRequest) {
                 "Forwarding failure for simulated payment {}: {fwd_err}",
                 hex::encode(request.payment_hash.0)
             );
-            // fail_idx is the index of the last hop whose channel successfully added the HTLC (None if
-            // the very first add failed), so the channel that failed is the one at the following hop.
             PaymentResult {
                 htlc_count: 0,
-                payment_outcome: PaymentOutcome::IndexFailure(fail_idx.map_or(0, |i| i + 1)),
+                payment_outcome: PaymentOutcome::IndexFailure(failed_index),
+                failure: Some(failure),
             }
         },
         Err(critical_err) => {
@@ -1885,6 +1950,7 @@ async fn propagate_payment(request: PropagatePaymentRequest) {
             PaymentResult {
                 htlc_count: 0,
                 payment_outcome: PaymentOutcome::Unknown,
+                failure: None,
             }
         },
     };
@@ -2591,11 +2657,13 @@ mod tests {
                         PaymentResult {
                             htlc_count: 2,
                             payment_outcome: PaymentOutcome::Success,
+                            failure: None,
                         }
                     } else if receiver == dest_2 {
                         PaymentResult {
                             htlc_count: 0,
                             payment_outcome: PaymentOutcome::InsufficientBalance,
+                            failure: None,
                         }
                     } else {
                         panic!("unknown mocked receiver");
@@ -2812,7 +2880,12 @@ mod tests {
 
         // A failure on our own first hop is returned, but tells the scorer nothing.
         set_channel_balance(0, (0, chan_capacity)).await;
-        let outcome = node.probe(path.clone(), listener.clone()).await.unwrap();
+        let outcome = node
+            .probe(path.clone(), listener.clone())
+            .await
+            .unwrap()
+            .result
+            .payment_outcome;
         assert_eq!(outcome, PaymentOutcome::IndexFailure(0));
         assert!(path.hops.iter().all(|hop| liquidity_range(hop).is_none()));
         set_channel_balance(0, (chan_capacity, 0)).await;
@@ -2820,7 +2893,12 @@ mod tests {
         // A failure on the last channel should lower our estimate of its liquidity below the probed amount, and
         // raise our estimate for the channels before it.
         set_channel_balance(2, (0, chan_capacity)).await;
-        let outcome = node.probe(path.clone(), listener.clone()).await.unwrap();
+        let outcome = node
+            .probe(path.clone(), listener.clone())
+            .await
+            .unwrap()
+            .result
+            .payment_outcome;
         assert_eq!(outcome, PaymentOutcome::IndexFailure(2));
         assert!(liquidity_range(&path.hops[1]).unwrap().0 >= amount_msat);
         assert!(liquidity_range(&path.hops[2]).unwrap().1 <= amount_msat);
@@ -2828,7 +2906,12 @@ mod tests {
 
         // A probe that reaches the destination shows that every channel had at least the probed amount, including
         // the channel that previously failed.
-        let outcome = node.probe(path.clone(), listener.clone()).await.unwrap();
+        let outcome = node
+            .probe(path.clone(), listener.clone())
+            .await
+            .unwrap()
+            .result
+            .payment_outcome;
         assert_eq!(outcome, PaymentOutcome::Success);
         assert!(path
             .hops
@@ -2872,7 +2955,12 @@ mod tests {
         .paths[0]
             .clone();
         let (shutdown, listener) = triggered::trigger();
-        let outcome = node.probe(path.clone(), listener.clone()).await.unwrap();
+        let outcome = node
+            .probe(path.clone(), listener.clone())
+            .await
+            .unwrap()
+            .result
+            .payment_outcome;
         assert_eq!(outcome, PaymentOutcome::IndexFailure(2));
 
         // The scorer tracks the upper bound as an offset below the channel's effective capacity, which is what decays.

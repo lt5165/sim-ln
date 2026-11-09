@@ -290,6 +290,27 @@ to identify the node.
 A summary of the results will be logged by the simulator. A full list of payments made with their outcomes
 is available in `simulation_{timestamp}.csv` within the configured `{data_dir}/results`.
 
+The same directory also contains:
+* `events_{timestamp}.csv`: every payment and every probe (see
+  [Background Probing](#background-probing)), with the same columns as the
+  payment results plus:
+  * `kind`: `payment` or `probe`.
+  * `failed_scid`, `failure_reason` and `failure_detail`: the channel that
+    could not carry a failed HTLC, the kind of failure (e.g.
+    `InsufficientBalance`, `ExceedsInFlightTotal`) and the full failure
+    message. These are only known on a simulated network.
+
+  `payment_outcome` is written in full, e.g. `IndexFailure(2)` for a
+  failure at the channel at hop index 2 of the path. For probes, `Success`
+  means that the probe reached its final hop.
+* `probe_balances_{timestamp}.csv` (only when probing): when a probe
+  resolves, one row for each channel on its path, comparing the probing
+  node's scorer estimate of the liquidity in the probe's direction
+  (`estimated_min_msat`, `estimated_max_msat`, empty if the scorer has no
+  estimate) with the sending node's actual balance (`actual_balance_msat`)
+  and the largest HTLC it could actually send (`actual_sendable_msat`).
+  Rows link to the events log by `probe_hash`.
+
 Run `sim-cli -h` for details on data directory (`--data-dir`) and other options including `--print-batch-size`
 which affect how simulation outputs are persisted
 
@@ -418,7 +439,8 @@ Simulated nodes can run background probing, which sends probes
 of channels in the network. Probe results train the node's pathfinding
 scorer, in the same way as LDK's background probing. Probes lock
 liquidity while they are in flight, but never move balances, and they
-are not included in the payment results.
+are not included in the payment results (they are written to the events
+and probe balances logs described in [Simulation Output](#simulation-output)).
 
 Probing is configured with an optional `probing` section:
 

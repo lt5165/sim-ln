@@ -229,6 +229,7 @@ impl LightningNode for ClnNode {
                         return Ok(PaymentResult {
                             htlc_count,
                             payment_outcome,
+                            failure: None,
                         });
                     }
                 },

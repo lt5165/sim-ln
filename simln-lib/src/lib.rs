@@ -28,6 +28,7 @@ use tokio_util::task::TaskTracker;
 use triggered::{Listener, Trigger};
 
 use self::defined_activity::DefinedPaymentActivity;
+use self::event_log::EventLog;
 use self::random_activity::{NetworkGraphView, RandomPaymentActivity};
 
 pub mod batched_writer;
@@ -35,6 +36,7 @@ pub mod cln;
 pub mod clock;
 mod defined_activity;
 pub mod eclair;
+pub mod event_log;
 pub mod latency_interceptor;
 pub mod ldk_server;
 pub mod lnd;
@@ -409,6 +411,22 @@ pub struct PaymentResult {
     /// The final outcome of the payment attempt, indicating whether it succeeded or failed
     /// (and if failed, the reason for failure).
     pub payment_outcome: PaymentOutcome,
+    /// Details of where and why an HTLC failed, when known. Only the simulated network provides this, because it can
+    /// see the exact forwarding error. Not included in the payment results CSV, to keep its format unchanged.
+    #[serde(skip)]
+    pub failure: Option<FailureDetails>,
+}
+
+/// Details of where and why an HTLC failed in the simulated network.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FailureDetails {
+    /// The short channel id of the channel that could not carry the HTLC, or `None` if the HTLC reached the recipient
+    /// and was rejected there.
+    pub failed_scid: Option<u64>,
+    /// The kind of failure, e.g. `InsufficientBalance` or `InsufficientFee`.
+    pub reason: String,
+    /// The full failure message, including the values that caused it.
+    pub detail: String,
 }
 
 impl PaymentResult {
@@ -419,6 +437,7 @@ impl PaymentResult {
         PaymentResult {
             htlc_count: 0,
             payment_outcome: PaymentOutcome::NotDispatched,
+            failure: None,
         }
     }
 
@@ -429,6 +448,7 @@ impl PaymentResult {
         PaymentResult {
             htlc_count: 0,
             payment_outcome: PaymentOutcome::TrackPaymentFailed,
+            failure: None,
         }
     }
 }
@@ -628,6 +648,8 @@ pub struct Simulation<C: Clock> {
     shutdown_listener: Listener,
     /// Clock for the simulation.
     clock: Arc<C>,
+    /// Combined log of payments and probes (and probe balance estimates), written if results are written.
+    event_log: Option<Arc<EventLog>>,
 }
 
 /// Configuration for writing simulation results to CSV files.
@@ -701,6 +723,14 @@ impl<C: Clock + 'static> Simulation<C> {
         shutdown_trigger: Trigger,
         shutdown_listener: Listener,
     ) -> Self {
+        let event_log = cfg.write_results.as_ref().map(|w| {
+            Arc::new(EventLog::new(
+                w.results_dir.clone(),
+                w.batch_size,
+                clock.now(),
+            ))
+        });
+
         Self {
             cfg,
             nodes,
@@ -709,7 +739,14 @@ impl<C: Clock + 'static> Simulation<C> {
             shutdown_trigger,
             shutdown_listener,
             clock,
+            event_log,
         }
+    }
+
+    /// Returns the combined payments and probes log, if results are being written. Probers should log to this so
+    /// that payments and probes end up in the same file.
+    pub fn event_log(&self) -> Option<Arc<EventLog>> {
+        self.event_log.clone()
     }
 
     /// validate_activity validates that the user-provided activity description is achievable for the network that
@@ -809,6 +846,12 @@ impl<C: Clock + 'static> Simulation<C> {
         // spawned during internal_run to complete.
         self.tasks.close();
         self.tasks.wait().await;
+
+        // Payments and probes (which run on their own tasks) are logged to the event log, so we only flush it once
+        // every task has finished.
+        if let Some(event_log) = &self.event_log {
+            event_log.flush()?;
+        }
         Ok(())
     }
 
@@ -957,6 +1000,7 @@ impl<C: Clock + 'static> Simulation<C> {
 
         // csr: consume simulation results
         let csr_write_results = self.cfg.write_results.clone();
+        let csr_event_log = self.event_log.clone();
         let clock = self.clock.clone();
         tasks.spawn(async move {
             log::debug!("Starting simulation results consumer.");
@@ -966,6 +1010,7 @@ impl<C: Clock + 'static> Simulation<C> {
                 results_receiver,
                 listener,
                 csr_write_results,
+                csr_event_log,
             )
             .await
             {
@@ -1390,6 +1435,7 @@ async fn consume_simulation_results(
     mut receiver: Receiver<(Payment, PaymentResult)>,
     listener: Listener,
     write_results: Option<WriteResults>,
+    event_log: Option<Arc<EventLog>>,
 ) -> Result<(), SimulationError> {
     let mut writer = None;
     if let Some(w) = write_results {
@@ -1416,6 +1462,10 @@ async fn consume_simulation_results(
                     Some((details, result)) => {
                         logger.lock().await.report_result(&details, &result);
                         log::trace!("Resolved dispatched payment: {} with: {}.", details, result);
+
+                        if let Some(ref event_log) = event_log {
+                            event_log.log_payment(&details, &result)?;
+                        }
 
                         if let Some(ref mut w) = writer{
                             w.queue((details, result))?;
@@ -2003,6 +2053,7 @@ mod tests {
             Ok(crate::PaymentResult {
                 htlc_count: 1,
                 payment_outcome: crate::PaymentOutcome::Success,
+                failure: None,
             })
         });
 

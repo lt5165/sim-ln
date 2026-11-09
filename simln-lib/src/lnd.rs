@@ -214,7 +214,8 @@ impl LightningNode for LndNode {
                         };
                         return Ok(PaymentResult {
                             htlc_count: payment.htlcs.len(),
-                            payment_outcome
+                            payment_outcome,
+                            failure: None,
                         });
                     },
                     None => {

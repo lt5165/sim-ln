@@ -153,6 +153,7 @@ impl LightningNode for LdkServerNode {
                     return Ok(PaymentResult {
                         htlc_count: 1,
                         payment_outcome,
+                        failure: None,
                     });
                 },
             }

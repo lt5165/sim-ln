@@ -347,14 +347,26 @@ pub async fn create_simulation_with_network(
     let validated_activities =
         get_validated_activities(&nodes_dyn, nodes_info, sim_params.activity.clone()).await?;
 
+    let seed = cfg.seed();
+    let simulation = Simulation::new(
+        cfg,
+        nodes_dyn,
+        tasks.clone(),
+        clock.clone(),
+        shutdown_trigger,
+        shutdown_listener.clone(),
+    );
+
     // Start background probing last, so that no probers are left running if setup fails. Probers run on the
-    // simulation's task tracker until it shuts down. Note that all nodes in the simulated network (including excluded
-    // nodes) can probe, because probing is separate from payment activity.
+    // simulation's task tracker until it shuts down, and log probes to the same log as the simulation's payments. Note
+    // that all nodes in the simulated network (including excluded nodes) can probe, because probing is separate from
+    // payment activity.
     if let Some(probing) = probing {
         start_probing(
             probing,
             &nodes,
-            cfg.seed(),
+            seed,
+            simulation.event_log(),
             &tasks,
             shutdown_listener.clone(),
         )?;
@@ -364,23 +376,12 @@ pub async fn create_simulation_with_network(
     // about channel liquidity fades over (simulated) time.
     tasks.spawn(run_scorer_decay(
         nodes.values().cloned().collect(),
-        clock.clone(),
+        clock,
         SCORER_DECAY_INTERVAL,
-        shutdown_listener.clone(),
+        shutdown_listener,
     ));
 
-    Ok((
-        Simulation::new(
-            cfg,
-            nodes_dyn,
-            tasks,
-            clock,
-            shutdown_trigger,
-            shutdown_listener,
-        ),
-        validated_activities,
-        nodes,
-    ))
+    Ok((simulation, validated_activities, nodes))
 }
 
 /// Creates a simulation to be run against a set of real lightning nodes, connecting to the nodes described in

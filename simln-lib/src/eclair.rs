@@ -197,6 +197,7 @@ impl LightningNode for EclairNode {
                         return Ok(PaymentResult {
                             htlc_count,
                             payment_outcome,
+                            failure: None,
                         });
                     }
                 },

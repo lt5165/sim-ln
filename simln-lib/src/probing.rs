@@ -40,7 +40,8 @@ use tokio_util::task::TaskTracker;
 use triggered::Listener;
 
 use crate::clock::Clock;
-use crate::sim_node::{find_payment_route_with_params, SimNetwork, SimNode};
+use crate::event_log::{EventLog, ProbeBalanceRecord};
+use crate::sim_node::{find_payment_route_with_params, ProbeResult, SimNetwork, SimNode};
 use crate::{LightningNode, PaymentOutcome, SimulationError};
 
 /// Default interval between probe attempts, in seconds. Matches LDK Node.
@@ -625,6 +626,8 @@ pub struct Prober<T: SimNetwork, C: Clock> {
     /// Total millisatoshis currently locked in in-flight probes.
     locked_msat: Arc<AtomicU64>,
     stats: Arc<ProbeStats>,
+    /// Log that probes and probe balance estimates are written to, if any.
+    event_log: Option<Arc<EventLog>>,
 }
 
 impl<T: SimNetwork + 'static, C: Clock + 'static> Prober<T, C> {
@@ -642,7 +645,15 @@ impl<T: SimNetwork + 'static, C: Clock + 'static> Prober<T, C> {
             max_locked_msat,
             locked_msat: Arc::new(AtomicU64::new(0)),
             stats: Arc::new(ProbeStats::default()),
+            event_log: None,
         }
+    }
+
+    /// Logs every probe that this prober sends, with the probing node's balance estimates for each channel on the
+    /// probe's path, to the log provided.
+    pub fn with_event_log(mut self, event_log: Arc<EventLog>) -> Self {
+        self.event_log = Some(event_log);
+        self
     }
 
     /// Returns the total millisatoshis currently locked in in-flight probes.
@@ -696,26 +707,43 @@ impl<T: SimNetwork + 'static, C: Clock + 'static> Prober<T, C> {
             let locked_msat = self.locked_msat.clone();
             let stats = self.stats.clone();
             let listener = listener.clone();
+            let event_log = self.event_log.clone();
             tasks.spawn(async move {
                 let result = node.probe(path.clone(), listener).await;
                 locked_msat.fetch_sub(amount_msat, Ordering::SeqCst);
 
-                match result {
-                    Ok(PaymentOutcome::Success) => {
-                        stats.reached_destination.fetch_add(1, Ordering::SeqCst);
-                        log::debug!(
-                            "Background probe from {pubkey} succeeded along the path: {}",
-                            fmt_path(&path)
-                        );
+                let probe = match result {
+                    Ok(probe) => probe,
+                    Err(e) => {
+                        log::debug!("Background probe from {pubkey} not resolved: {e}");
+                        return;
                     },
-                    Ok(outcome) => {
-                        stats.failed.fetch_add(1, Ordering::SeqCst);
-                        log::debug!(
-                            "Background probe from {pubkey} failed with {outcome:?} along the path: {}",
-                            fmt_path(&path)
-                        );
-                    },
-                    Err(e) => log::debug!("Background probe from {pubkey} not resolved: {e}"),
+                };
+
+                if probe.result.payment_outcome == PaymentOutcome::Success {
+                    stats.reached_destination.fetch_add(1, Ordering::SeqCst);
+                    log::debug!(
+                        "Background probe from {pubkey} succeeded along the path: {}",
+                        fmt_path(&path)
+                    );
+                } else {
+                    stats.failed.fetch_add(1, Ordering::SeqCst);
+                    log::debug!(
+                        "Background probe from {pubkey} failed with {:?} ({}) along the path: {}",
+                        probe.result.payment_outcome,
+                        probe
+                            .result
+                            .failure
+                            .as_ref()
+                            .map_or("unknown reason".to_string(), |f| f.detail.clone()),
+                        fmt_path(&path)
+                    );
+                }
+
+                if let Some(event_log) = event_log {
+                    if let Err(e) = record_probe(&node, &path, &probe, &event_log).await {
+                        log::error!("Could not log probe from {pubkey}: {e}");
+                    }
                 }
             });
         }
@@ -729,6 +757,69 @@ impl<T: SimNetwork + 'static, C: Clock + 'static> Prober<T, C> {
             self.stats.skipped_over_budget.load(Ordering::SeqCst),
         );
     }
+}
+
+/// Writes a resolved probe to the event log, along with a row for each channel on its path that compares the probing
+/// node's (just updated) scorer estimate of the channel's liquidity with its actual balance.
+async fn record_probe<T: SimNetwork, C: Clock>(
+    node: &SimNode<T, C>,
+    path: &Path,
+    probe: &ProbeResult,
+    event_log: &EventLog,
+) -> Result<(), SimulationError> {
+    let observer = node.get_info().pubkey;
+    event_log.log_probe(observer, path, probe)?;
+
+    let time = node.clock.now();
+    let estimates: Vec<Option<(u64, u64)>> = {
+        let scorer = node.scorer.read().map_err(|e| {
+            SimulationError::SimulatedNetworkError(format!("scorer lock poisoned: {e}"))
+        })?;
+        path.hops
+            .iter()
+            .map(|hop| {
+                scorer.estimated_channel_liquidity_range(
+                    hop.short_channel_id,
+                    &NodeId::from_pubkey(&hop.pubkey),
+                )
+            })
+            .collect()
+    };
+
+    let mut from_node = observer;
+    for (hop_index, (hop, estimate)) in path.hops.iter().zip(estimates).enumerate() {
+        let channel = node
+            .network_channels(&from_node)
+            .await?
+            .into_iter()
+            .find(|c| c.short_channel_id == hop.short_channel_id)
+            .ok_or_else(|| {
+                SimulationError::SimulatedNetworkError(format!(
+                    "channel {} not found for {from_node}",
+                    hop.short_channel_id
+                ))
+            })?;
+
+        event_log.log_balance(&ProbeBalanceRecord {
+            time,
+            probe_hash: Some(probe.payment_hash),
+            observer,
+            probe_outcome: probe.result.payment_outcome.clone(),
+            hop_index,
+            scid: hop.short_channel_id,
+            from_node,
+            to_node: hop.pubkey,
+            capacity_msat: channel.capacity_msat,
+            estimated_min_msat: estimate.map(|(min, _)| min),
+            estimated_max_msat: estimate.map(|(_, max)| max),
+            actual_balance_msat: channel.local_balance_msat,
+            actual_sendable_msat: channel.next_outbound_htlc_limit_msat,
+        })?;
+
+        from_node = hop.pubkey;
+    }
+
+    Ok(())
 }
 
 fn fmt_path(path: &Path) -> String {
@@ -745,6 +836,7 @@ pub fn start_probing<T: SimNetwork + 'static, C: Clock + 'static>(
     config: &ProbingConfig,
     nodes: &HashMap<PublicKey, Arc<SimNode<T, C>>>,
     seed: Option<u64>,
+    event_log: Option<Arc<EventLog>>,
     tasks: &TaskTracker,
     listener: Listener,
 ) -> Result<(), SimulationError> {
@@ -787,12 +879,15 @@ pub fn start_probing<T: SimNetwork + 'static, C: Clock + 'static>(
             )),
         };
 
-        let prober = Prober::new(
+        let mut prober = Prober::new(
             node.clone(),
             strategy,
             Duration::from_secs(config.interval_secs),
             config.max_locked_msat,
         );
+        if let Some(event_log) = &event_log {
+            prober = prober.with_event_log(event_log.clone());
+        }
         tasks.spawn(prober.run(tasks.clone(), listener.clone()));
     }
 
@@ -809,6 +904,7 @@ mod tests {
     };
     use crate::test_utils::get_random_keypair;
     use crate::{PaymentOutcome, ShortChannelID};
+    use std::time::UNIX_EPOCH;
     use tokio::sync::Mutex;
     use tokio_util::task::TaskTracker;
     use triggered::{Listener, Trigger};
@@ -916,7 +1012,12 @@ mod tests {
             let amount = path.final_value_msat();
             assert!((10_000..=100_000).contains(&amount));
 
-            let outcome = node.probe(path, network.shutdown.1.clone()).await.unwrap();
+            let outcome = node
+                .probe(path, network.shutdown.1.clone())
+                .await
+                .unwrap()
+                .result
+                .payment_outcome;
             assert_eq!(outcome, PaymentOutcome::Success);
         }
 
@@ -938,7 +1039,12 @@ mod tests {
             let unique: HashSet<u64> = hops.iter().copied().collect();
             assert_eq!(unique.len(), hops.len(), "{hops:?}");
 
-            let outcome = node.probe(path, network.shutdown.1.clone()).await.unwrap();
+            let outcome = node
+                .probe(path, network.shutdown.1.clone())
+                .await
+                .unwrap()
+                .result
+                .payment_outcome;
             assert_eq!(outcome, PaymentOutcome::Success);
         }
 
@@ -993,7 +1099,12 @@ mod tests {
         let path = strategy.next_probe().await.unwrap();
         assert_eq!(scids(&path), vec![0, 1]);
         assert_eq!(path.hops.last().unwrap().pubkey, hub);
-        let outcome = node.probe(path, network.shutdown.1.clone()).await.unwrap();
+        let outcome = node
+            .probe(path, network.shutdown.1.clone())
+            .await
+            .unwrap()
+            .result
+            .payment_outcome;
         assert_eq!(outcome, PaymentOutcome::Success);
 
         // H is now on cooldown, so the next target is B (degree 2). B is our direct peer, and a single-hop probe tells
@@ -1178,10 +1289,69 @@ mod tests {
             &config,
             &network.nodes,
             None,
+            None,
             &network.tasks,
             network.shutdown.1.clone()
         )
         .is_err());
+
+        network.shutdown().await;
+    }
+
+    /// Tests that a resolved probe is written to the events log, with a balances row for every channel on its path
+    /// that pairs the probing node's scorer estimate with the channel's actual state.
+    #[tokio::test]
+    async fn test_record_probe_logs_estimates_and_actual_balances() {
+        let capacity = 500_000_000;
+        let network = TestNetwork::new(4, &[(0, 1), (1, 2), (2, 3)], capacity).await;
+        let node = network.node(0);
+        let dir = tempfile::tempdir().unwrap();
+        let event_log = EventLog::new(dir.path().to_path_buf(), 1, UNIX_EPOCH);
+
+        let strategy = RandomWalkStrategy::new(node.clone(), 3, 10_000, 10_000, Some(9));
+        let path = loop {
+            let path = strategy.next_probe().await.unwrap();
+            if path.hops.len() == 3 {
+                break path;
+            }
+        };
+        let probe = node
+            .probe(path.clone(), network.shutdown.1.clone())
+            .await
+            .unwrap();
+        assert_eq!(probe.result.payment_outcome, PaymentOutcome::Success);
+        record_probe(&node, &path, &probe, &event_log)
+            .await
+            .unwrap();
+        event_log.flush().unwrap();
+
+        let mut events = csv::Reader::from_path(dir.path().join("events_0.csv")).unwrap();
+        let events: Vec<csv::StringRecord> = events.records().map(|r| r.unwrap()).collect();
+        assert_eq!(events.len(), 1);
+        assert_eq!(&events[0][0], "probe");
+        assert_eq!(&events[0][2], network.pubkeys[3].to_string());
+
+        let mut balances = csv::Reader::from_path(dir.path().join("probe_balances_0.csv")).unwrap();
+        let headers = balances.headers().unwrap().clone();
+        let column = |name: &str| headers.iter().position(|h| h == name).unwrap();
+        let rows: Vec<csv::StringRecord> = balances.records().map(|r| r.unwrap()).collect();
+        assert_eq!(rows.len(), 3);
+
+        for (i, row) in rows.iter().enumerate() {
+            assert_eq!(row[column("hop_index")], i.to_string());
+            assert_eq!(row[column("scid")], i.to_string());
+            assert_eq!(row[column("from_node")], network.pubkeys[i].to_string());
+            assert_eq!(row[column("to_node")], network.pubkeys[i + 1].to_string());
+            assert_eq!(row[column("observer")], network.pubkeys[0].to_string());
+            // The probe reached its destination, so every channel is estimated to hold at least the probed amount.
+            let estimated_min: u64 = row[column("estimated_min_msat")].parse().unwrap();
+            assert!(estimated_min >= 10_000);
+            // Probes never move balances, so each channel still has its starting balance of half its capacity.
+            assert_eq!(
+                row[column("actual_balance_msat")],
+                (capacity / 2).to_string()
+            );
+        }
 
         network.shutdown().await;
     }
