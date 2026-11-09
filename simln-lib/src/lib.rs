@@ -1073,17 +1073,20 @@ impl<C: Clock + 'static> Simulation<C> {
         for (pk, node) in self.nodes.iter() {
             let chan_capacity = node.channel_capacities().await?;
 
-            if let Err(e) = RandomPaymentActivity::validate_capacity(
-                chan_capacity,
-                self.cfg.expected_payment_msat,
-            ) {
+            // Don't double count channel capacity because each channel reports the total balance between counter
+            // parities. Track capacity separately to be used for our network generator.
+            let capacity = chan_capacity / 2;
+
+            // Validate the same (halved) capacity that the node's activity generator is created with, and that its
+            // payment amounts are drawn from. Validating the full capacity here let nodes with between 2x and 4x the
+            // expected payment amount through, only for generator creation to fail and abort the simulation.
+            if let Err(e) =
+                RandomPaymentActivity::validate_capacity(capacity, self.cfg.expected_payment_msat)
+            {
                 log::warn!("Node: {} not eligible for activity generation: {e}.", *pk);
                 continue;
             }
 
-            // Don't double count channel capacity because each channel reports the total balance between counter
-            // parities. Track capacity separately to be used for our network generator.
-            let capacity = chan_capacity / 2;
             let node_info = node.get_node_info(pk).await?;
             active_nodes.insert(node_info.pubkey, (node_info, capacity));
         }
@@ -1868,6 +1871,54 @@ mod tests {
         assert!(
             matches!(result, Err(LightningError::ValidationError(msg)) if msg.contains("At least two nodes required"))
         );
+    }
+
+    /// Verifies that random activity skips a node whose capacity is between 2x and 4x the expected payment amount,
+    /// rather than aborting. Nodes are checked against half of their channel capacity (to avoid double counting
+    /// channels), so such a node can't generate payments, but it used to pass an eligibility check made against its
+    /// full capacity and then fail when its activity generator was created.
+    #[tokio::test]
+    async fn test_random_activity_skips_nodes_between_two_and_four_times_expected_amount() {
+        let expected_payment_msat = 1_000_000;
+        let capacities = [100_000_000, 100_000_000, 3 * expected_payment_msat];
+
+        let mut clients: HashMap<PublicKey, Arc<dyn LightningNode>> = HashMap::new();
+        let mut small_node = None;
+        for capacity in capacities {
+            let node_info = NodeInfo {
+                pubkey: test_utils::get_random_keypair().1,
+                alias: String::new(),
+                features: lightning::types::features::NodeFeatures::empty(),
+            };
+            if capacity < 4 * expected_payment_msat {
+                small_node = Some(node_info.pubkey);
+            }
+
+            let pubkey = node_info.pubkey;
+            let mut node = MockLightningNode::new();
+            node.expect_get_info().return_const(node_info.clone());
+            node.expect_channel_capacities()
+                .returning(move || Ok(capacity));
+            node.expect_get_node_info()
+                .returning(move |_| Ok(node_info.clone()));
+            clients.insert(pubkey, Arc::new(node));
+        }
+
+        let (shutdown_trigger, shutdown_listener) = triggered::trigger();
+        let simulation = Simulation::new(
+            SimulationCfg::new(Some(0), expected_payment_msat, 2.0, None, None),
+            clients,
+            TaskTracker::new(),
+            Arc::new(SimulationClock::new(SystemTime::now())),
+            shutdown_trigger,
+            shutdown_listener,
+        );
+
+        let executors = simulation.activity_executors(&[]).await.unwrap();
+        assert_eq!(executors.len(), 2);
+        assert!(executors
+            .iter()
+            .all(|e| Some(e.source_info.pubkey) != small_node));
     }
 
     /// Verifies that an empty activity fails when one of two nodes doesn’t support keysend,
