@@ -442,6 +442,40 @@ This is required for the case where you want to specify a channel that
 will be used in the simulated network that is just responsible for 
 forwarding payments, but does not send or receive any payments itself.
 
+### Converting an LND Graph Snapshot
+
+Instead of writing `sim_network` by hand, you can build it from a
+snapshot of a real network's public graph, in the format produced by
+LND's `lncli describegraph`:
+
+```
+lncli describegraph > graph.json
+python3 scripts/describegraph_to_simln.py graph.json sim.json
+```
+
+The output is a simulation file with a `sim_network` section, which you
+can run as is (with random activity) or extend with `activity`,
+`exclude` or `probing` sections. The script prints how many channels and
+nodes it kept, and why it skipped any.
+
+A public graph doesn't contain everything a simulated channel needs, so
+the script fills in:
+* `max_htlc_count`: 483, the protocol maximum.
+* `max_in_flight_msat`: the channel capacity.
+* `max_htlc_size_msat`: the policy's `max_htlc_msat` when present (older
+  snapshots don't have it), otherwise the channel capacity.
+* Balances are never public: each channel starts split 50/50.
+
+It skips channels that have no policy for one direction, zero capacity,
+the same node at both ends, or a repeated channel id. The simulated
+network can't represent disabled channels, so they are kept as usable
+unless you pass `--drop-disabled`, which drops any channel with a
+disabled direction. Aliases shared by more than one node are cleared,
+because sim-ln requires unique aliases.
+
+The script needs only the Python standard library. Its tests run with
+`python3 -m unittest discover scripts`.
+
 ### Background Probing
 
 Simulated nodes can run background probing, which sends probes
