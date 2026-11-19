@@ -672,6 +672,9 @@ struct ExecutorKit {
 }
 
 struct PaymentEvent {
+    /// Index of the executor (one per activity) that generated this event. A source node can have several
+    /// executors, so the source alone does not identify the activity that the event belongs to.
+    executor_id: usize,
     source: PublicKey,
     execution_time: SystemTime,
     destination: NodeInfo,
@@ -685,12 +688,14 @@ struct ExecutorPaymentTracker {
 
 impl Ord for PaymentEvent {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        // Order primarily by execution time, then break ties on the source node's public key. The heap only ever holds
-        // at most one event per source at a time, so `(execution_time, source)` is a total order. Without the tie-break,
-        // events scheduled for the same instant pop in an unspecified order, which makes runs non-reproducible.
+        // Order primarily by execution time, then break ties on the source node's public key, then on the executor.
+        // The heap only ever holds at most one event per executor at a time, so `(execution_time, source,
+        // executor_id)` is a total order. Without the tie-breaks, events scheduled for the same instant pop in an
+        // unspecified order, which makes runs non-reproducible.
         self.execution_time
             .cmp(&other.execution_time)
             .then_with(|| self.source.cmp(&other.source))
+            .then_with(|| self.executor_id.cmp(&other.executor_id))
     }
 }
 
@@ -702,7 +707,7 @@ impl PartialOrd for PaymentEvent {
 
 impl PartialEq for PaymentEvent {
     fn eq(&self, other: &Self) -> bool {
-        self.execution_time == other.execution_time && self.source == other.source
+        self.cmp(other) == std::cmp::Ordering::Equal
     }
 }
 
@@ -1129,19 +1134,19 @@ impl<C: Clock + 'static> Simulation<C> {
         tasks: &TaskTracker,
     ) -> Result<(), SimulationError> {
         let mut heap: BinaryHeap<Reverse<PaymentEvent>> = BinaryHeap::new();
-        let mut payments_tracker: HashMap<PublicKey, ExecutorPaymentTracker> = HashMap::new();
+        // Tracked per executor, not per source node: several defined activities can share a source, and each one
+        // needs its own generator and payment count.
+        let mut payments_tracker: Vec<ExecutorPaymentTracker> = Vec::with_capacity(executors.len());
 
         // In order to choose a deterministic destination is necessary to sort the nodes by its public key.
         executors.sort_by(|ex1, ex2| ex1.source_info.pubkey.cmp(&ex2.source_info.pubkey));
         let now = self.clock.now();
-        for executor in executors {
-            let source = executor.source_info.pubkey;
-            let payment_tracker = ExecutorPaymentTracker {
+        for (executor_id, executor) in executors.into_iter().enumerate() {
+            payments_tracker.push(ExecutorPaymentTracker {
                 executor,
                 payments_completed: 0,
-            };
-            payments_tracker.insert(source, payment_tracker);
-            generate_payment(&mut heap, source, &mut payments_tracker, now).await?;
+            });
+            generate_payment(&mut heap, executor_id, &mut payments_tracker, now).await?;
         }
 
         let shutdown = self.shutdown_trigger.clone();
@@ -1180,7 +1185,7 @@ impl<C: Clock + 'static> Simulation<C> {
 /// appropriate for the defined activity.
 async fn produce_payment_events<C: Clock>(
     mut heap: BinaryHeap<Reverse<PaymentEvent>>,
-    mut payments_tracker: HashMap<PublicKey, ExecutorPaymentTracker>,
+    mut payments_tracker: Vec<ExecutorPaymentTracker>,
     nodes: HashMap<PublicKey, Arc<dyn LightningNode>>,
     clock: Arc<C>,
     output_sender: Sender<SimulationOutput>,
@@ -1200,6 +1205,7 @@ async fn produce_payment_events<C: Clock>(
             _ = async {} => {
                 match heap.pop() {
                     Some(Reverse(PaymentEvent {
+                        executor_id,
                         source,
                         execution_time,
                         destination,
@@ -1217,8 +1223,8 @@ async fn produce_payment_events<C: Clock>(
                                 Duration::from_secs(0)
                             }
                         };
-                        let payment_tracker = payments_tracker.get_mut(&source).ok_or(SimulationError::PaymentGenerationError(
-                                PaymentGenerationError(format!("executor {} not found", source)),
+                        let payment_tracker = payments_tracker.get_mut(executor_id).ok_or(SimulationError::PaymentGenerationError(
+                                PaymentGenerationError(format!("executor {executor_id} for {source} not found")),
                         ))?;
 
                         if let Some(c) = payment_tracker.executor.payment_generator.payment_count() {
@@ -1242,7 +1248,7 @@ async fn produce_payment_events<C: Clock>(
                             log::debug!(
                                 "Skipping zero amount payment for {source} -> {}.", destination
                             );
-                            generate_payment(&mut heap, source, &mut payments_tracker, clock.now()).await?;
+                            generate_payment(&mut heap, executor_id, &mut payments_tracker, clock.now()).await?;
                             continue;
                         }
 
@@ -1256,7 +1262,7 @@ async fn produce_payment_events<C: Clock>(
                             // Wait until our time to next payment has elapsed then execute a random amount payment to a random
                             // destination.
                             _ = pe_clock.sleep(wait_time) => {
-                                generate_payment(&mut heap, source, &mut payments_tracker, clock.now()).await?;
+                                generate_payment(&mut heap, executor_id, &mut payments_tracker, clock.now()).await?;
 
                                 // Stamp the dispatch time from the simulation clock now that the wait has elapsed.
                                 let dispatch_time = pe_clock.now();
@@ -1288,15 +1294,15 @@ async fn produce_payment_events<C: Clock>(
 
 async fn generate_payment(
     heap: &mut BinaryHeap<Reverse<PaymentEvent>>,
-    pubkey: PublicKey,
-    payments_tracker: &mut HashMap<PublicKey, ExecutorPaymentTracker>,
+    executor_id: usize,
+    payments_tracker: &mut [ExecutorPaymentTracker],
     base_time: SystemTime,
 ) -> Result<(), SimulationError> {
     let payment_tracker =
         payments_tracker
-            .get(&pubkey)
+            .get(executor_id)
             .ok_or(SimulationError::PaymentGenerationError(
-                PaymentGenerationError(format!("executor {} not found", pubkey)),
+                PaymentGenerationError(format!("executor {executor_id} not found")),
             ))?;
     let wait_time = get_payment_delay(
         payment_tracker.payments_completed,
@@ -1325,7 +1331,8 @@ async fn generate_payment(
         .map_err(SimulationError::PaymentGenerationError)?;
 
     let payment_event = PaymentEvent {
-        source: pubkey,
+        executor_id,
+        source: payment_tracker.executor.source_info.pubkey,
         execution_time: absolute_time,
         destination,
         amount,
@@ -1759,6 +1766,7 @@ mod tests {
 
         let when = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
         let event = |source: &NodeInfo, destination: &NodeInfo| PaymentEvent {
+            executor_id: 0,
             source: source.pubkey,
             execution_time: when,
             destination: destination.clone(),
@@ -2202,6 +2210,61 @@ mod tests {
             payments_list.lock().unwrap(),
             expected_payment_list,
         );
+    }
+
+    // Two defined activities from the same source node must be scheduled independently, each
+    // with its own destination, interval and count.
+    #[tokio::test(start_paused = true)]
+    async fn test_defined_activities_same_source() {
+        let (network, payments_list) =
+            setup_test_nodes_for_testing_deterministic_events(Some(fixed_test_pubkeys()));
+
+        // Activity 1: node_1 to node_2 every 3s, three times.
+        let activity_1 = crate::ActivityDefinition {
+            source: network.nodes[0].clone(),
+            destination: network.nodes[1].clone(),
+            start_secs: None,
+            count: Some(3),
+            interval_secs: crate::ValueOrRange::Value(3),
+            amount_msat: crate::ValueOrRange::Value(2000),
+        };
+
+        // Activity 2: node_1 to node_3 every 2s, four times.
+        let activity_2 = crate::ActivityDefinition {
+            source: network.nodes[0].clone(),
+            destination: network.nodes[2].clone(),
+            start_secs: None,
+            count: Some(4),
+            interval_secs: crate::ValueOrRange::Value(2),
+            amount_msat: crate::ValueOrRange::Value(3000),
+        };
+
+        let (shutdown_trigger, shutdown_listener) = triggered::trigger();
+        let clock = Arc::new(SimulationClock::new(SystemTime::now()));
+        let simulation = Simulation::new(
+            SimulationCfg::new(None, 100, 2.0, None, None),
+            network.get_client_hashmap(),
+            TaskTracker::new(),
+            clock.clone(),
+            shutdown_trigger,
+            shutdown_listener,
+        );
+
+        let _ = simulation.run(&vec![activity_1, activity_2]).await;
+
+        // Activity 1 pays at t = 3, 6, 9 and activity 2 at t = 2, 4, 6, 8. At t = 6, where both
+        // fire from the same source, activity 1 goes first because it is listed first.
+        let expected_payment_list = vec![
+            network.nodes[2].pubkey,
+            network.nodes[1].pubkey,
+            network.nodes[2].pubkey,
+            network.nodes[1].pubkey,
+            network.nodes[2].pubkey,
+            network.nodes[2].pubkey,
+            network.nodes[1].pubkey,
+        ];
+
+        assert_eq!(*payments_list.lock().unwrap(), expected_payment_list);
     }
 
     // Run on a paused runtime so that the payment interval sleeps auto-advance rather than
