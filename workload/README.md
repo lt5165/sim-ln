@@ -2,7 +2,7 @@
 
 Builds a trace for sim-ln's trace replay (`time_secs,source,destination,amount_msat`) by mapping IBM's TabFormer
 synthetic credit card transactions onto a Lightning graph snapshot, following the payment workload plan (parts A and
-B1-B4; card payments only). Raw and generated data live in `data/`, which is git-ignored.
+B1-B5): card payments, plus top-ups from exchanges to leaves and sweeps from merchant nodes to exchanges. Raw and generated data live in `data/`, which is git-ignored.
 
 ## Setup
 
@@ -36,6 +36,7 @@ python3 build_workload.py --graph GRAPH.json --btc-usd 63114.76   # B1-B4: the t
 |---|---|---|
 | `--graph` | `graph_2026-11-19.json` (own LND node, capacities from mempool.space) | current topology |
 | `--disabled` | `block` | disabled directions get max HTLC 0; channels disabled both ways are dropped |
+| `--unblock-leaf-inbound` | on | a disabled direction into a leaf stays usable: peers disable it when the wallet is offline, and a wallet is taken to be online whenever it pays or is paid (2,553 sending leaves would otherwise be unable to receive) |
 | `--btc-usd` | 63114.76 | fixed price, no rescaling of card amounts |
 | timing | TabFormer's own pace, no compression | keeps each user's rhythm |
 | `--window-year` | 2019 | last full year in TabFormer |
@@ -43,10 +44,14 @@ python3 build_workload.py --graph GRAPH.json --btc-usd 63114.76   # B1-B4: the t
 | `--merchant-share-hubs` | 0.70 | plan default |
 | `--user-assignment`, `--rank-window` | rank, 0.05 | leaves draw users within +-5 percentile points of their own rank |
 | clones | time jitter +-7 days, amount scale lognormal sigma 0.2, no per-payment noise | plan defaults; per-payment noise left off |
-| payment types | card payments only | no p2p, exchange or sweep traffic yet |
+| payment types | card, top-up, sweep | no p2p or exchange-to-exchange traffic yet |
+| `--topup-threshold` | 0.5 | once a leaf's card spend since its last top-up reaches half its starting outbound balance, its home exchange (one per leaf, drawn by exchange capacity) sends that amount, at most its largest channel's starting inbound |
+| `--sweep-threshold` | 0.10 | once a hub or mid node's card receipts since its last sweep reach 10% of its starting inbound balance, it sends them to an exchange drawn by capacity, in chunks no larger than its largest channel's starting outbound |
+| `--inflow-delay-s` | 60 | top-ups and sweeps go out 60 s after the card payment that triggers them; sweep chunks are 60 s apart |
 | `--seed` | 42 | outputs are byte-identical across runs |
 
-Senders are leaves with at least one usable outgoing direction, and merchants are only mapped to hubs and mid nodes with
+Top-ups and sweeps are precomputed from running totals of the card payments, assuming they all succeed: the trace can't
+react to balances during a run. Senders are leaves with at least one usable outgoing direction, and merchants are only mapped to hubs and mid nodes with
 at least one usable incoming direction.
 
 ## Outputs

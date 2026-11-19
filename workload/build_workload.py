@@ -1,15 +1,27 @@
 """Builds a payment trace for sim-ln's trace replay from TabFormer card transactions and a Lightning graph snapshot,
-following the payment workload plan (parts B1-B4, card payments only).
+following the payment workload plan (parts B1-B5): card payments, plus top-ups from exchanges to leaves and sweeps
+from merchant nodes to exchanges.
 
 Steps:
 1. Convert the graph with sim-ln's converter (scripts/describegraph_to_simln.py), so that the trace and the simulated
    network contain exactly the same nodes and channels. By default, directions that were disabled in the snapshot are
-   blocked (max HTLC of 0), and channels disabled in both directions are dropped.
+   blocked (max HTLC of 0), and channels disabled in both directions are dropped. With --unblock-leaf-inbound (on by
+   default), a disabled direction into a leaf is kept usable instead: a peer usually disables its side when the leaf
+   goes offline, and a wallet is taken to be online whenever it pays or is paid.
 2. B1: classify nodes into roles by total capacity and degree.
 3. B2: map TabFormer merchants onto hub and mid nodes, many merchants per node, in proportion to node capacity.
 4. B3: give every leaf node a TabFormer user (users matched to leaves by rank), and replay that user's payments from the
    leaf with one time offset and one amount scale per clone.
 5. B4: convert USD to msat at a fixed BTC price, keeping TabFormer's own timing.
+6. B5: inflows, precomputed from running totals of the card payments (assuming they all succeed):
+   - top-ups: once a leaf's card spend since its last top-up reaches --topup-threshold of its starting outbound
+     balance, its home exchange (one per leaf, drawn in proportion to exchange capacity) sends it that amount, at most
+     what the leaf's largest channel could receive at the start; anything left over counts towards the next top-up.
+   - sweeps: once a hub or mid node's card receipts since its last sweep reach --sweep-threshold of its starting
+     inbound balance, it sends them to an exchange drawn in proportion to capacity, split into payments no larger
+     than it could send over its largest channel at the start.
+   Each goes out --inflow-delay-s after the card payment that triggered it, and sweep chunks follow at the same
+   spacing. Inflows use their own random generator, so the card payments are the same as without them.
 
 Usage (from workload/):
     python3 build_workload.py --graph data/raw/topology/graph_2026-11-19.json --btc-usd 63114.76
@@ -17,11 +29,11 @@ Usage (from workload/):
 Outputs, in data/processed/workload/<graph name>_<config hash>/:
     sim.json          sim-ln simulation file: the converted network plus "trace": "trace.csv"
     trace.csv         time_secs,source,destination,amount_msat (sorted by time)
-    payments.parquet  the trace with provenance: user, merchant, clone, oversize flag
+    payments.parquet  the trace with its type (card, topup, sweep) and provenance: user, merchant, clone, oversize flag
     node_roles.csv    pubkey, role, total_capacity_sat, degree
     merchant_map.csv  merchant_id, mcc (several separated by ';' if a merchant has more than one), node_pubkey,
                       window_volume_usd
-    user_map.csv      leaf_pubkey, tabformer_user, time_offset_s, amount_scale
+    user_map.csv      leaf_pubkey, tabformer_user, time_offset_s, amount_scale, home_exchange
     manifest.json     parameters, input hashes and row counts
 """
 
@@ -56,6 +68,8 @@ def parse_args(argv=None):
     ap.add_argument("--online-only", action="store_true", help="use only online card transactions")
     ap.add_argument("--disabled", choices=["keep", "drop", "block"], default="block",
                     help="how the converter treats directions disabled in the snapshot (see the converter)")
+    ap.add_argument("--unblock-leaf-inbound", action=argparse.BooleanOptionalAction, default=True,
+                    help="with --disabled block, keep a disabled direction usable when it points into a leaf")
     ap.add_argument("--hub-top-frac", type=float, default=0.02)
     ap.add_argument("--n-exchanges", type=int, default=10)
     ap.add_argument("--leaf-max-degree", type=int, default=3)
@@ -69,6 +83,15 @@ def parse_args(argv=None):
     ap.add_argument("--payment-amount-sigma", type=float, default=0.0,
                     help="per-payment lognormal amount noise (0 = off)")
     ap.add_argument("--sender-fraction", type=float, default=1.0)
+    ap.add_argument("--topup-threshold", type=float, default=0.5,
+                    help="share of a leaf's starting outbound balance spent before its exchange tops it up (0 = no "
+                         "top-ups)")
+    ap.add_argument("--sweep-threshold", type=float, default=0.10,
+                    help="share of a merchant node's starting inbound balance received before it sweeps to an "
+                         "exchange (0 = no sweeps)")
+    ap.add_argument("--inflow-delay-s", type=float, default=60.0,
+                    help="delay between the card payment that triggers a top-up or sweep and its first payment, and "
+                         "between a sweep's chunks")
     return ap.parse_args(argv)
 
 
@@ -88,20 +111,28 @@ def convert_graph(graph_path, out_path, disabled):
 
 
 def node_stats(sim_network):
-    """Returns per-node total capacity (sat), degree, the largest amount (msat) the node could send over a single
-    channel at the start of a simulation (half the capacity, at most the channel's max HTLC), and whether the node can
-    receive over at least one channel (its peer's direction towards it isn't blocked)."""
-    capacity, degree, max_send, can_receive = {}, {}, {}, {}
+    """Returns per-node dicts, all at the start of a simulation (every channel split 50/50):
+    - capacity: total capacity (sat); degree: channel count;
+    - max_send / max_recv: the largest amount (msat) the node could send / receive over a single channel (half the
+      capacity, at most the sending side's max HTLC);
+    - out_balance / in_balance: total balance (msat) it could send / receive, over directions that aren't blocked.
+    A node can receive if max_recv > 0."""
+    stats = {k: {} for k in ("capacity", "degree", "max_send", "max_recv", "out_balance", "in_balance")}
     for c in sim_network:
-        cap_sat = c["capacity_msat"] // 1000
+        half = c["capacity_msat"] // 2
         for side, other in (("node_1", "node_2"), ("node_2", "node_1")):
             pk = c[side]["pubkey"]
-            capacity[pk] = capacity.get(pk, 0) + cap_sat
-            degree[pk] = degree.get(pk, 0) + 1
-            sendable = min(c["capacity_msat"] // 2, c[side]["max_htlc_size_msat"])
-            max_send[pk] = max(max_send.get(pk, 0), sendable)
-            can_receive[pk] = can_receive.get(pk, False) or c[other]["max_htlc_size_msat"] > 0
-    return capacity, degree, max_send, can_receive
+            out_htlc, in_htlc = c[side]["max_htlc_size_msat"], c[other]["max_htlc_size_msat"]
+            for key, value in (
+                ("capacity", c["capacity_msat"] // 1000),
+                ("degree", 1),
+                ("out_balance", half if out_htlc > 0 else 0),
+                ("in_balance", half if in_htlc > 0 else 0),
+            ):
+                stats[key][pk] = stats[key].get(pk, 0) + value
+            stats["max_send"][pk] = max(stats["max_send"].get(pk, 0), min(half, out_htlc))
+            stats["max_recv"][pk] = max(stats["max_recv"].get(pk, 0), min(half, in_htlc))
+    return stats
 
 
 def classify_roles(capacity, degree, hub_top_frac, n_exchanges, leaf_max_degree):
@@ -174,6 +205,40 @@ def assign_users(leaves, users, capacity, rng, method, rank_window):
     return mapping
 
 
+def build_inflows(cards, roles, stats, rng, topup_threshold, sweep_threshold, delay_s):
+    """B5: top-ups and sweeps from running totals of the card payments.
+
+    cards: (time_secs, source, destination, amount_msat) in time order. Returns a list of
+    (time_secs, source, destination, amount_msat, type) and each leaf's home exchange."""
+    exchanges = sorted(pk for pk, r in roles.items() if r == "exchange" and stats["max_send"][pk] > 0)
+    weights = [stats["capacity"][pk] for pk in exchanges]
+    senders = sorted({source for _, source, _, _ in cards})
+    home = {leaf: rng.choices(exchanges, weights)[0] for leaf in senders} if topup_threshold > 0 else {}
+
+    spent, received, inflows = {}, {}, []
+    for time_secs, source, destination, amount in cards:
+        if topup_threshold > 0 and stats["max_recv"][source] > 0:
+            spent[source] = spent.get(source, 0) + amount
+            if spent[source] >= topup_threshold * stats["out_balance"][source]:
+                topup = min(spent[source], stats["max_recv"][source])
+                spent[source] -= topup
+                inflows.append((time_secs + delay_s, home[source], source, topup, "topup"))
+        if sweep_threshold > 0 and roles[destination] in ("hub", "mid"):
+            received[destination] = received.get(destination, 0) + amount
+            if received[destination] >= sweep_threshold * stats["in_balance"][destination]:
+                to = rng.choices(exchanges, weights)[0]
+                remaining, chunk = received.pop(destination), stats["max_send"][destination]
+                if chunk == 0:
+                    continue  # can't send at all
+                n = 0
+                while remaining > 0:
+                    n += 1
+                    amount_now = min(remaining, chunk)
+                    inflows.append((time_secs + n * delay_s, destination, to, amount_now, "sweep"))
+                    remaining -= amount_now
+    return inflows, home
+
+
 def config_hash(args):
     keys = {k: v for k, v in vars(args).items() if k not in ("out_root", "tabformer", "graph")}
     keys["graph"] = os.path.basename(args.graph)
@@ -193,10 +258,28 @@ def main(argv=None):
     with open(network_path) as f:
         sim_network = json.load(f)["sim_network"]
     os.remove(network_path)
-    capacity, degree, max_send, can_receive = node_stats(sim_network)
+    stats = node_stats(sim_network)
 
-    # 2. Roles.
-    roles = classify_roles(capacity, degree, args.hub_top_frac, args.n_exchanges, args.leaf_max_degree)
+    # 2. Roles. They depend only on capacity and degree, which unblocking directions below doesn't change.
+    roles = classify_roles(stats["capacity"], stats["degree"], args.hub_top_frac, args.n_exchanges,
+                           args.leaf_max_degree)
+
+    unblocked = 0
+    if args.unblock_leaf_inbound and args.disabled == "block":
+        # The keep conversion has the same channels plus those disabled both ways, with every direction's own max HTLC.
+        convert_graph(args.graph, network_path, "keep")
+        with open(network_path) as f:
+            original = {c["scid"]: c for c in json.load(f)["sim_network"]}
+        os.remove(network_path)
+        for c in sim_network:
+            for side, other in (("node_1", "node_2"), ("node_2", "node_1")):
+                kept = original[c["scid"]][side]["max_htlc_size_msat"]
+                if c[side]["max_htlc_size_msat"] == 0 and kept > 0 and roles[c[other]["pubkey"]] == "leaf":
+                    c[side]["max_htlc_size_msat"] = kept
+                    unblocked += 1
+        stats = node_stats(sim_network)
+    capacity, degree, max_send = stats["capacity"], stats["degree"], stats["max_send"]
+    can_receive = {pk: v > 0 for pk, v in stats["max_recv"].items()}
     by_role = {r: sorted(pk for pk, x in roles.items() if x == r) for r in ("exchange", "hub", "mid", "leaf")}
 
     # TabFormer window, with the plan's A3 filters.
@@ -273,13 +356,42 @@ def main(argv=None):
         JOIN merchant_map m ON m.merchant_id = t.merchant_id
         """
     )
+    # 6. Inflows: top-ups and sweeps, from running totals of the card payments in time order. Their own generator keeps
+    # the card payments the same whether or not inflows are on.
+    cards = con.sql(
+        "SELECT time_secs, source, destination, amount_msat FROM payments "
+        "ORDER BY time_secs, source, original_ts, source_card, source_merchant, amount_msat"
+    ).fetchall()
+    inflows, home_exchange = build_inflows(
+        cards, roles, stats, random.Random(f"{args.seed}-inflows"), args.topup_threshold, args.sweep_threshold,
+        args.inflow_delay_s,
+    )
+    del cards
+    # Loaded through a CSV file: executemany inserts one row at a time, which takes far too long for millions of rows.
+    inflows_csv = os.path.join(out, "inflows.tmp.csv")
+    with open(inflows_csv, "w") as f:
+        f.write("time_secs,source,destination,amount_msat,type,seq\n")
+        for i, (t, src, dst, amt, kind) in enumerate(inflows):
+            f.write(f"{t!r},{src},{dst},{amt},{kind},{i}\n")
+    con.sql(
+        f"CREATE TABLE inflows AS SELECT * FROM read_csv('{inflows_csv}', header = true, columns = {{"
+        "'time_secs': 'DOUBLE', 'source': 'VARCHAR', 'destination': 'VARCHAR', 'amount_msat': 'UBIGINT', "
+        "'type': 'VARCHAR', 'seq': 'INTEGER'})"
+    )
+    os.remove(inflows_csv)
     con.sql(
         """
         CREATE TABLE payments_flagged AS
         SELECT p.*, p.amount_msat > s.max_send_msat AS oversize_flag
-        FROM payments p JOIN max_send s ON s.pubkey = p.source
+        FROM (
+            SELECT time_secs, source, destination, amount_msat, 'card' AS type, source_user, source_card,
+                source_merchant, mcc, card_channel, original_ts, original_amount_usd, NULL::INTEGER AS seq
+            FROM payments
+            UNION ALL BY NAME
+            SELECT time_secs, source, destination, amount_msat, type, seq FROM inflows
+        ) p JOIN max_send s ON s.pubkey = p.source
         -- A total order, so equal-time payments are always written in the same order.
-        ORDER BY time_secs, source, original_ts, source_card, source_merchant, amount_msat
+        ORDER BY time_secs, source, type, original_ts, source_card, source_merchant, amount_msat, seq
         """
     )
 
@@ -300,9 +412,12 @@ def main(argv=None):
         TO '{os.path.join(out, 'merchant_map.csv')}' (HEADER, DELIMITER ',')
         """
     )
+    con.sql("CREATE TABLE home_exchange (leaf_pubkey VARCHAR, home_exchange VARCHAR)")
+    con.executemany("INSERT INTO home_exchange VALUES (?, ?)", list(home_exchange.items()))
     con.sql(
         f"COPY (SELECT leaf_pubkey, user_id AS tabformer_user, round(time_offset_s, 3) AS time_offset_s, "
-        f"round(amount_scale, 6) AS amount_scale FROM user_map ORDER BY 1) "
+        f"round(amount_scale, 6) AS amount_scale, h.home_exchange "
+        f"FROM user_map LEFT JOIN home_exchange h USING (leaf_pubkey) ORDER BY 1) "
         f"TO '{os.path.join(out, 'user_map.csv')}' (HEADER, DELIMITER ',')"
     )
     with open(os.path.join(out, "sim.json"), "w") as f:
@@ -315,6 +430,14 @@ def main(argv=None):
             "count(DISTINCT destination), min(time_secs), max(time_secs) FROM payments_flagged"
         ).fetchone(),
     ))
+    counts["by_type"] = {
+        t: {"payments": n, "volume_btc": round(v / MSAT_PER_BTC, 3), "senders": s_, "receivers": r_}
+        for t, n, v, s_, r_ in con.sql(
+            "SELECT type, count(*), sum(amount_msat), count(DISTINCT source), count(DISTINCT destination) "
+            "FROM payments_flagged GROUP BY 1 ORDER BY 1"
+        ).fetchall()
+    }
+    counts["leaves_that_cannot_receive_topups"] = sum(1 for pk in user_map if stats["max_recv"][pk] == 0)
     manifest = {
         "parameters": {k: v for k, v in vars(args).items() if k != "out_root"},
         "inputs": {
@@ -323,6 +446,7 @@ def main(argv=None):
             "converter": f"scripts/describegraph_to_simln.py --disabled {args.disabled}",
         },
         "conversion_summary": conversion.strip().splitlines(),
+        "directions_into_leaves_unblocked": unblocked,
         "roles": {r: len(v) for r, v in by_role.items()},
         "excluded": {
             "leaves that can't send (all outgoing directions blocked)": len(by_role["leaf"]) - len(senders),
