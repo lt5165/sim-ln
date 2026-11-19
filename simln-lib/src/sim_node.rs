@@ -1097,6 +1097,14 @@ pub trait Interceptor: Send + Sync {
         Ok(())
     }
 
+    /// Holds a resolved htlc at this hop before its settle or failure is passed back to the previous hop. Unlike
+    /// [`Interceptor::notify_resolution`], this may block: it is how interceptors model the time a resolution takes to
+    /// travel back towards the sender. All interceptors are called concurrently, so the hop waits for the slowest one.
+    /// Default implementation returns immediately.
+    async fn delay_resolution(&self, _res: InterceptResolution) -> Result<(), CriticalError> {
+        Ok(())
+    }
+
     /// Returns an identifying name for the interceptor for logging, does not need to be unique.
     fn name(&self) -> String;
 }
@@ -1161,6 +1169,7 @@ impl Display for InterceptRequest {
 
 /// Notification sent to an external interceptor notifying that a htlc that was previously intercepted has been
 /// resolved.
+#[derive(Clone)]
 pub struct InterceptResolution {
     /// The node that is forwarding this HTLC.
     pub forwarding_node: PublicKey,
@@ -1825,20 +1834,31 @@ async fn remove_htlcs(
         // We drop our node lock so that we can notify interceptors without blocking other payments processing.
         drop(node_lock);
 
+        let resolution = InterceptResolution {
+            forwarding_node: hop.pubkey,
+            incoming_htlc: HtlcRef {
+                channel_id: incoming_scid,
+                index,
+            },
+            outgoing_channel_id,
+            success,
+        };
+
         for interceptor in interceptors.iter() {
             log::trace!("Sending resolution to interceptor: {}", interceptor.name());
+            interceptor.notify_resolution(resolution.clone()).await?;
+        }
 
-            interceptor
-                .notify_resolution(InterceptResolution {
-                    forwarding_node: hop.pubkey,
-                    incoming_htlc: HtlcRef {
-                        channel_id: incoming_scid,
-                        index,
-                    },
-                    outgoing_channel_id,
-                    success,
-                })
-                .await?;
+        // Hold the resolution at this hop for as long as the slowest interceptor asks, before passing it back to the
+        // previous hop.
+        let mut delays: JoinSet<Result<(), CriticalError>> = JoinSet::new();
+        for interceptor in interceptors.iter() {
+            let interceptor = Arc::clone(interceptor);
+            let resolution = resolution.clone();
+            delays.spawn(async move { interceptor.delay_resolution(resolution).await });
+        }
+        while let Some(res) = delays.join_next().await {
+            res.map_err(|e| CriticalError::InterceptorError(e.to_string()))??;
         }
 
         outgoing_channel_id = Some(incoming_scid);

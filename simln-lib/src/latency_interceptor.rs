@@ -1,5 +1,6 @@
 use crate::sim_node::{
-    CriticalError, CustomRecords, ForwardingError, InterceptRequest, Interceptor,
+    CriticalError, CustomRecords, ForwardingError, InterceptRequest, InterceptResolution,
+    Interceptor,
 };
 use crate::SimulationError;
 use async_trait::async_trait;
@@ -9,7 +10,9 @@ use std::sync::Mutex;
 use std::time::Duration;
 use tokio::{select, time};
 
-/// LatencyIntercepor is a HTLC interceptor that will delay HTLC forwarding by some randomly chosen delay.
+/// LatencyIntercepor is a HTLC interceptor that delays HTLCs by a randomly chosen amount at each hop, in both
+/// directions: once as the HTLC is forwarded towards the recipient, and again as its settle or failure travels back
+/// towards the sender. Each delay is sampled independently.
 pub struct LatencyIntercepor<D>
 where
     D: Distribution<f32> + Send + Sync,
@@ -43,16 +46,12 @@ fn seeded_rng(seed: Option<u64>) -> StdRng {
     }
 }
 
-#[async_trait]
-impl<D> Interceptor for LatencyIntercepor<D>
+impl<D> LatencyIntercepor<D>
 where
     D: Distribution<f32> + Send + Sync,
 {
-    /// Introduces a random sleep time on the HTLC.
-    async fn intercept_htlc(
-        &self,
-        req: InterceptRequest,
-    ) -> Result<Result<CustomRecords, ForwardingError>, CriticalError> {
+    /// Samples a single hop's delay from the latency distribution.
+    fn sample_latency(&self) -> Duration {
         let latency = {
             let mut rng = self
                 .rng
@@ -60,12 +59,34 @@ where
                 .expect("latency interceptor RNG lock poisoned");
             self.latency_dist.sample(&mut *rng)
         };
+        Duration::from_millis(latency as u64)
+    }
+}
+
+#[async_trait]
+impl<D> Interceptor for LatencyIntercepor<D>
+where
+    D: Distribution<f32> + Send + Sync,
+{
+    /// Introduces a random sleep time on the HTLC as it is forwarded.
+    async fn intercept_htlc(
+        &self,
+        req: InterceptRequest,
+    ) -> Result<Result<CustomRecords, ForwardingError>, CriticalError> {
+        let latency = self.sample_latency();
 
         select! {
             _ = req.shutdown_listener => log::debug!("Latency interceptor exiting due to shutdown signal received."),
-            _ = time::sleep(Duration::from_millis(latency as u64)) => {}
+            _ = time::sleep(latency) => {}
         }
         Ok(Ok(CustomRecords::default()))
+    }
+
+    /// Introduces a random sleep time on the HTLC's resolution. HTLCs are resolved one hop at a time from the
+    /// recipient back to the sender, so sleeping here delays each hop of the settle or failure on its way back.
+    async fn delay_resolution(&self, _res: InterceptResolution) -> Result<(), CriticalError> {
+        time::sleep(self.sample_latency()).await;
+        Ok(())
     }
 
     fn name(&self) -> String {
@@ -78,7 +99,7 @@ mod tests {
     use std::time::Duration;
 
     use super::{Interceptor, LatencyIntercepor};
-    use crate::sim_node::{CustomRecords, HtlcRef, InterceptRequest};
+    use crate::sim_node::{CustomRecords, HtlcRef, InterceptRequest, InterceptResolution};
     use crate::test_utils::get_random_keypair;
     use crate::ShortChannelID;
     use lightning::types::payment::PaymentHash;
@@ -160,5 +181,30 @@ mod tests {
         })
         .await
         .is_ok());
+    }
+
+    /// Tests that resolutions are delayed by the sampled latency, so that settles and failures travel back towards
+    /// the sender with the same per-hop delay as the forward path.
+    #[tokio::test(start_paused = true)]
+    async fn test_resolution_latency() {
+        let latency_dist = ConstantDistribution { value: 500.0 };
+        let interceptor = LatencyIntercepor {
+            latency_dist,
+            rng: Mutex::new(StdRng::seed_from_u64(0)),
+        };
+
+        let resolution = InterceptResolution {
+            forwarding_node: get_random_keypair().1,
+            incoming_htlc: HtlcRef {
+                channel_id: ShortChannelID::from(123),
+                index: 1,
+            },
+            outgoing_channel_id: None,
+            success: true,
+        };
+
+        let start = tokio::time::Instant::now();
+        interceptor.delay_resolution(resolution).await.unwrap();
+        assert_eq!(start.elapsed(), Duration::from_millis(500));
     }
 }
