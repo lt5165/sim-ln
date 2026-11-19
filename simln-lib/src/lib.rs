@@ -12,7 +12,7 @@ use rand_chacha::ChaCha8Rng;
 use random_activity::RandomActivityError;
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, VecDeque};
 use std::fmt::{Display, Formatter};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::marker::Send;
@@ -197,6 +197,29 @@ pub struct ActivityDefinition {
     pub interval_secs: Interval,
     /// The amount of m_sat to used in this payment.
     pub amount_msat: Amount,
+}
+
+/// A single payment replayed from a trace: `source` pays `destination` `amount_msat` at `time` after the start of the
+/// simulation. As for every other payment, the amount is what the destination receives, and the source pays any
+/// routing fees on top of it.
+#[derive(Debug, Clone)]
+pub struct TracePayment {
+    /// When to send the payment, measured from the start of the simulation.
+    pub time: Duration,
+    /// The node that sends the payment.
+    pub source: NodeInfo,
+    /// The node that receives the payment.
+    pub destination: NodeInfo,
+    /// The amount delivered to the destination, excluding routing fees.
+    pub amount_msat: u64,
+}
+
+/// The payments that a simulation run sends.
+enum Workload<'a> {
+    /// Defined activities, or random activity if there are none.
+    Activity(&'a [ActivityDefinition]),
+    /// Payments replayed from a trace.
+    Trace(Vec<TracePayment>),
 }
 
 /// Represents errors that can occur during simulation execution.
@@ -675,10 +698,21 @@ pub struct WriteResults {
 /// spin up the appropriate producers and consumers for the activity.
 struct ExecutorKit {
     source_info: NodeInfo,
-    /// We use an arc mutex here because some implementations of the trait will be very expensive to clone.
-    /// See [NetworkGraphView] for details.
-    network_generator: Arc<dyn DestinationGenerator>,
-    payment_generator: Box<dyn PaymentGenerator>,
+    payments: ExecutorPayments,
+}
+
+/// How an executor produces its payments.
+enum ExecutorPayments {
+    /// Payments drawn from generators, each one sent a wait after the previous one.
+    Generated {
+        /// We use an arc mutex here because some implementations of the trait will be very expensive to clone.
+        /// See [NetworkGraphView] for details.
+        network_generator: Arc<dyn DestinationGenerator>,
+        payment_generator: Box<dyn PaymentGenerator>,
+    },
+    /// The source's payments from a trace, in the order to send them. Each is sent at its own time after the start
+    /// of the simulation, so that rounding can't accumulate over a long trace.
+    Trace(VecDeque<TracePayment>),
 }
 
 struct PaymentEvent {
@@ -817,6 +851,45 @@ impl<C: Clock + 'static> Simulation<C> {
         Ok(())
     }
 
+    /// Validates a trace: it must have payments, each with a non-zero amount, from a node that we control to a
+    /// different node that supports keysend.
+    fn validate_trace(&self, trace: &[TracePayment]) -> Result<(), LightningError> {
+        if trace.is_empty() {
+            return Err(LightningError::ValidationError(
+                "The trace has no payments".to_string(),
+            ));
+        }
+
+        for payment in trace {
+            if payment.amount_msat == 0 {
+                return Err(LightningError::ValidationError(format!(
+                    "Trace payment at {:?} from {} has a zero amount",
+                    payment.time, payment.source
+                )));
+            }
+            if !self.nodes.contains_key(&payment.source.pubkey) {
+                return Err(LightningError::ValidationError(format!(
+                    "Trace payment source not found, {}",
+                    payment.source
+                )));
+            }
+            if payment.source.pubkey == payment.destination.pubkey {
+                return Err(LightningError::ValidationError(format!(
+                    "Trace payment at {:?} from {} is to itself",
+                    payment.time, payment.source
+                )));
+            }
+            if !payment.destination.features.supports_keysend() {
+                return Err(LightningError::ValidationError(format!(
+                    "Destination node does not support keysend, {}",
+                    payment.destination
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
     /// validates that the nodes are all on the same network and ensures that we're not running on mainnet.
     async fn validate_node_network(&self) -> Result<(), LightningError> {
         if self.nodes.is_empty() {
@@ -856,7 +929,17 @@ impl<C: Clock + 'static> Simulation<C> {
     /// Note that it will wait for the tasks in self.tasks to complete
     /// before returning.
     pub async fn run(&self, activity: &[ActivityDefinition]) -> Result<(), SimulationError> {
-        self.internal_run(activity).await?;
+        self.run_workload(Workload::Activity(activity)).await
+    }
+
+    /// Runs the simulation, sending each payment in `trace` once, at its time. The run ends when the last payment has
+    /// been sent and resolved, or when the simulation's total time is reached, whichever comes first.
+    pub async fn run_trace(&self, trace: Vec<TracePayment>) -> Result<(), SimulationError> {
+        self.run_workload(Workload::Trace(trace)).await
+    }
+
+    async fn run_workload(&self, workload: Workload<'_>) -> Result<(), SimulationError> {
+        self.internal_run(workload).await?;
         // Close our TaskTracker and wait for any background tasks
         // spawned during internal_run to complete.
         self.tasks.close();
@@ -870,7 +953,7 @@ impl<C: Clock + 'static> Simulation<C> {
         Ok(())
     }
 
-    async fn internal_run(&self, activity: &[ActivityDefinition]) -> Result<(), SimulationError> {
+    async fn internal_run(&self, workload: Workload<'_>) -> Result<(), SimulationError> {
         if let Some(total_time) = self.cfg.total_time {
             log::info!("Running the simulation for {}s.", total_time.as_secs());
         } else {
@@ -878,13 +961,24 @@ impl<C: Clock + 'static> Simulation<C> {
         }
 
         self.validate_node_network().await?;
-        self.validate_activity(activity).await?;
-
-        log::info!(
-            "Simulating {} activity on {} nodes.",
-            activity.len(),
-            self.nodes.len()
-        );
+        match &workload {
+            Workload::Activity(activity) => {
+                self.validate_activity(activity).await?;
+                log::info!(
+                    "Simulating {} activity on {} nodes.",
+                    activity.len(),
+                    self.nodes.len()
+                );
+            },
+            Workload::Trace(trace) => {
+                self.validate_trace(trace)?;
+                log::info!(
+                    "Replaying a trace of {} payments on {} nodes.",
+                    trace.len(),
+                    self.nodes.len()
+                );
+            },
+        }
 
         // Before we start the simulation up, start tasks that will be responsible for gathering simulation data.
         // The event channels are shared across our functionality:
@@ -896,7 +990,11 @@ impl<C: Clock + 'static> Simulation<C> {
         self.run_data_collection(event_receiver, &self.tasks);
 
         // Get an execution kit per activity that we need to generate and spin up consumers for each source node.
-        let activities = match self.activity_executors(activity).await {
+        let executors = match workload {
+            Workload::Activity(activity) => self.activity_executors(activity).await,
+            Workload::Trace(trace) => Ok(trace_executors(trace)),
+        };
+        let activities = match executors {
             Ok(a) => a,
             Err(e) => {
                 // If we encounter an error while setting up the activity_executors,
@@ -1063,8 +1161,10 @@ impl<C: Clock + 'static> Simulation<C> {
                     source_info: description.source.clone(),
                     // Defined activities have very simple generators, so the traits required are implemented on
                     // a single struct which we just cheaply clone.
-                    network_generator: Arc::new(activity_generator.clone()),
-                    payment_generator: Box::new(activity_generator),
+                    payments: ExecutorPayments::Generated {
+                        network_generator: Arc::new(activity_generator.clone()),
+                        payment_generator: Box::new(activity_generator),
+                    },
                 });
             }
         } else {
@@ -1122,17 +1222,19 @@ impl<C: Clock + 'static> Simulation<C> {
             let salted_rng = MutRng::new(seed_opt);
             generators.push(ExecutorKit {
                 source_info: node_info.clone(),
-                network_generator: network_generator.clone(),
-                payment_generator: Box::new(
-                    RandomPaymentActivity::new(
-                        *capacity,
-                        self.cfg.expected_payment_msat,
-                        self.cfg.activity_multiplier,
-                        salted_rng,
-                    )
-                    .map_err(SimulationError::RandomActivityError)?
-                    .with_min_payment_amt(self.cfg.min_payment_msat),
-                ),
+                payments: ExecutorPayments::Generated {
+                    network_generator: network_generator.clone(),
+                    payment_generator: Box::new(
+                        RandomPaymentActivity::new(
+                            *capacity,
+                            self.cfg.expected_payment_msat,
+                            self.cfg.activity_multiplier,
+                            salted_rng,
+                        )
+                        .map_err(SimulationError::RandomActivityError)?
+                        .with_min_payment_amt(self.cfg.min_payment_msat),
+                    ),
+                },
             });
         }
 
@@ -1160,7 +1262,7 @@ impl<C: Clock + 'static> Simulation<C> {
                 executor,
                 payments_completed: 0,
             });
-            generate_payment(&mut heap, executor_id, &mut payments_tracker, now).await?;
+            generate_payment(&mut heap, executor_id, &mut payments_tracker, now, now).await?;
         }
 
         let shutdown = self.shutdown_trigger.clone();
@@ -1178,6 +1280,7 @@ impl<C: Clock + 'static> Simulation<C> {
             if let Err(e) = produce_payment_events(
                 heap,
                 payments_tracker,
+                now,
                 nodes,
                 clock,
                 output_sender,
@@ -1200,6 +1303,7 @@ impl<C: Clock + 'static> Simulation<C> {
 async fn produce_payment_events<C: Clock>(
     mut heap: BinaryHeap<Reverse<PaymentEvent>>,
     mut payments_tracker: Vec<ExecutorPaymentTracker>,
+    start_time: SystemTime,
     nodes: HashMap<PublicKey, Arc<dyn LightningNode>>,
     clock: Arc<C>,
     output_sender: Sender<SimulationOutput>,
@@ -1225,26 +1329,31 @@ async fn produce_payment_events<C: Clock>(
                         destination,
                         amount
                     })) => {
+                        let payment_tracker = payments_tracker.get_mut(executor_id).ok_or(SimulationError::PaymentGenerationError(
+                                PaymentGenerationError(format!("executor {executor_id} for {source} not found")),
+                        ))?;
+
                         let internal_now = clock.now();
                         let wait_time = match execution_time.duration_since(internal_now) {
-                            Ok(elapsed) => {
-                                // The output of duration_since is not perfectly round affecting the waiting time
-                                // and as consequence the results are not deterministic; for this reason
-                                // it is necessary to round the output.
-                                Duration::from_secs(elapsed.as_secs_f64().round() as u64)
+                            // The output of duration_since is not perfectly round affecting the waiting time
+                            // and as consequence the results are not deterministic; for this reason
+                            // it is necessary to round the output. Generated payments are scheduled in whole
+                            // seconds, trace payments to the millisecond.
+                            Ok(elapsed) => match payment_tracker.executor.payments {
+                                ExecutorPayments::Generated { .. } => Duration::from_secs(elapsed.as_secs_f64().round() as u64),
+                                ExecutorPayments::Trace(_) => Duration::from_millis((elapsed.as_secs_f64() * 1000.0).round() as u64),
                             },
                             Err(_e) => {
                                 Duration::from_secs(0)
                             }
                         };
-                        let payment_tracker = payments_tracker.get_mut(executor_id).ok_or(SimulationError::PaymentGenerationError(
-                                PaymentGenerationError(format!("executor {executor_id} for {source} not found")),
-                        ))?;
 
-                        if let Some(c) = payment_tracker.executor.payment_generator.payment_count() {
-                            if c == payment_tracker.payments_completed {
-                                log::info!( "Payment count has been met for {}: {c} payments. Stopping the activity.", source);
-                                continue
+                        if let ExecutorPayments::Generated { payment_generator, .. } = &payment_tracker.executor.payments {
+                            if let Some(c) = payment_generator.payment_count() {
+                                if c == payment_tracker.payments_completed {
+                                    log::info!( "Payment count has been met for {}: {c} payments. Stopping the activity.", source);
+                                    continue
+                                }
                             }
                         }
                         let node = nodes.get(&source).ok_or(
@@ -1262,7 +1371,7 @@ async fn produce_payment_events<C: Clock>(
                             log::debug!(
                                 "Skipping zero amount payment for {source} -> {}.", destination
                             );
-                            generate_payment(&mut heap, executor_id, &mut payments_tracker, clock.now()).await?;
+                            generate_payment(&mut heap, executor_id, &mut payments_tracker, clock.now(), start_time).await?;
                             continue;
                         }
 
@@ -1276,7 +1385,7 @@ async fn produce_payment_events<C: Clock>(
                             // Wait until our time to next payment has elapsed then execute a random amount payment to a random
                             // destination.
                             _ = pe_clock.sleep(wait_time) => {
-                                generate_payment(&mut heap, executor_id, &mut payments_tracker, clock.now()).await?;
+                                generate_payment(&mut heap, executor_id, &mut payments_tracker, clock.now(), start_time).await?;
 
                                 // Stamp the dispatch time from the simulation clock now that the wait has elapsed.
                                 let dispatch_time = pe_clock.now();
@@ -1306,25 +1415,55 @@ async fn produce_payment_events<C: Clock>(
     Ok(())
 }
 
+/// Pushes the executor's next payment onto the heap. Generated payments are scheduled a wait after `base_time`, and
+/// trace payments at their own time after `start_time`, the start of the simulation. A trace executor whose payments
+/// have all been sent pushes nothing.
 async fn generate_payment(
     heap: &mut BinaryHeap<Reverse<PaymentEvent>>,
     executor_id: usize,
     payments_tracker: &mut [ExecutorPaymentTracker],
     base_time: SystemTime,
+    start_time: SystemTime,
 ) -> Result<(), SimulationError> {
-    let payment_tracker =
-        payments_tracker
-            .get(executor_id)
-            .ok_or(SimulationError::PaymentGenerationError(
-                PaymentGenerationError(format!("executor {executor_id} not found")),
-            ))?;
-    let wait_time = get_payment_delay(
-        payment_tracker.payments_completed,
-        &payment_tracker.executor.source_info,
-        payment_tracker.executor.payment_generator.as_ref(),
-    )?;
-    let absolute_time = base_time
-        .checked_add(wait_time)
+    let ExecutorPaymentTracker {
+        executor,
+        payments_completed,
+    } = payments_tracker
+        .get_mut(executor_id)
+        .ok_or(SimulationError::PaymentGenerationError(
+            PaymentGenerationError(format!("executor {executor_id} not found")),
+        ))?;
+    let source = executor.source_info.pubkey;
+
+    let (execution_time, destination, amount) = match &mut executor.payments {
+        ExecutorPayments::Generated {
+            network_generator,
+            payment_generator,
+        } => {
+            let wait_time = get_payment_delay(
+                *payments_completed,
+                &executor.source_info,
+                payment_generator.as_ref(),
+            )?;
+            let (destination, capacity) = network_generator
+                .choose_destination(source)
+                .map_err(SimulationError::DestinationGenerationError)?;
+            let amount = payment_generator
+                .payment_amount(capacity)
+                .map_err(SimulationError::PaymentGenerationError)?;
+            (base_time.checked_add(wait_time), destination, amount)
+        },
+        ExecutorPayments::Trace(payments) => match payments.pop_front() {
+            Some(payment) => (
+                start_time.checked_add(payment.time),
+                payment.destination,
+                payment.amount_msat,
+            ),
+            None => return Ok(()),
+        },
+    };
+
+    let execution_time = execution_time
         .ok_or("Overflow adding duration")
         .map_err(|e| {
             SimulationError::PaymentGenerationError(PaymentGenerationError(format!(
@@ -1332,27 +1471,38 @@ async fn generate_payment(
             )))
         })?;
 
-    let (destination, capacity) = payment_tracker
-        .executor
-        .network_generator
-        .choose_destination(payment_tracker.executor.source_info.pubkey)
-        .map_err(SimulationError::DestinationGenerationError)?;
-
-    let amount = payment_tracker
-        .executor
-        .payment_generator
-        .payment_amount(capacity)
-        .map_err(SimulationError::PaymentGenerationError)?;
-
-    let payment_event = PaymentEvent {
+    heap.push(Reverse(PaymentEvent {
         executor_id,
-        source: payment_tracker.executor.source_info.pubkey,
-        execution_time: absolute_time,
+        source,
+        execution_time,
         destination,
         amount,
-    };
-    heap.push(Reverse(payment_event));
+    }));
     Ok(())
+}
+
+/// Creates one executor per source node in a trace, holding that node's payments in time order. Payments with the
+/// same time keep their order in the trace.
+fn trace_executors(trace: Vec<TracePayment>) -> Vec<ExecutorKit> {
+    let mut by_source: HashMap<PublicKey, (NodeInfo, Vec<TracePayment>)> = HashMap::new();
+    for payment in trace {
+        by_source
+            .entry(payment.source.pubkey)
+            .or_insert_with(|| (payment.source.clone(), Vec::new()))
+            .1
+            .push(payment);
+    }
+
+    by_source
+        .into_values()
+        .map(|(source_info, mut payments)| {
+            payments.sort_by_key(|p| p.time);
+            ExecutorKit {
+                source_info,
+                payments: ExecutorPayments::Trace(payments.into()),
+            }
+        })
+        .collect()
 }
 
 /// events that are crated for a lightning node that we can execute events on. Any output that is generated from the
@@ -2327,6 +2477,96 @@ mod tests {
         ];
 
         assert_eq!(*payments_list.lock().unwrap(), expected_payment_list);
+    }
+
+    fn trace_payment(
+        time_ms: u64,
+        source: &NodeInfo,
+        destination: &NodeInfo,
+        amount_msat: u64,
+    ) -> crate::TracePayment {
+        crate::TracePayment {
+            time: Duration::from_millis(time_ms),
+            source: source.clone(),
+            destination: destination.clone(),
+            amount_msat,
+        }
+    }
+
+    // Each trace payment is sent once, in time order across all sources, at its own (sub-second) time.
+    #[tokio::test(start_paused = true)]
+    async fn test_trace_replay() {
+        let (network, payments_list) =
+            setup_test_nodes_for_testing_deterministic_events(Some(fixed_test_pubkeys()));
+        let n = &network.nodes;
+
+        // Listed out of order, with two sources and two payments from node_1 at the same time.
+        let trace = vec![
+            trace_payment(1_500, &n[0], &n[1], 1_000),
+            trace_payment(500, &n[0], &n[2], 2_000),
+            trace_payment(1_000, &n[2], &n[3], 3_000),
+            trace_payment(1_500, &n[0], &n[3], 4_000),
+            trace_payment(250, &n[2], &n[0], 5_000),
+        ];
+
+        let (shutdown_trigger, shutdown_listener) = triggered::trigger();
+        let clock = Arc::new(SimulationClock::new(SystemTime::now()));
+        let simulation = Simulation::new(
+            SimulationCfg::new(None, 100, 2.0, None, None),
+            network.get_client_hashmap(),
+            TaskTracker::new(),
+            clock.clone(),
+            shutdown_trigger,
+            shutdown_listener,
+        );
+
+        let start = clock.now();
+        simulation.run_trace(trace).await.unwrap();
+        let elapsed = clock.now().duration_since(start).unwrap();
+
+        // In time order; the two payments at 1.5 s keep their order in the trace.
+        assert_eq!(
+            *payments_list.lock().unwrap(),
+            vec![
+                n[0].pubkey,
+                n[2].pubkey,
+                n[3].pubkey,
+                n[1].pubkey,
+                n[3].pubkey
+            ]
+        );
+        // The run ends with the last payment, at 1.5 s: times are not rounded to whole seconds.
+        assert_eq!(elapsed, Duration::from_millis(1_500));
+    }
+
+    #[tokio::test]
+    async fn test_validate_trace() {
+        let network = LightningTestNodeBuilder::new(3).build_full();
+        let simulation = test_utils::create_simulation(network.get_client_hashmap());
+        let n = &network.nodes;
+        let outside = test_utils::create_nodes(1, 100_000)[0].0.clone();
+
+        let cases = vec![
+            (vec![], "has no payments"),
+            (vec![trace_payment(0, &n[0], &n[1], 0)], "zero amount"),
+            (
+                vec![trace_payment(0, &outside, &n[1], 1_000)],
+                "source not found",
+            ),
+            (vec![trace_payment(0, &n[0], &n[0], 1_000)], "to itself"),
+        ];
+        for (trace, expected) in cases {
+            match simulation.validate_trace(&trace) {
+                Err(LightningError::ValidationError(msg)) => {
+                    assert!(msg.contains(expected), "{msg} should contain {expected}")
+                },
+                other => panic!("expected a validation error containing {expected}, got {other:?}"),
+            }
+        }
+
+        assert!(simulation
+            .validate_trace(&[trace_payment(0, &n[0], &n[1], 1_000)])
+            .is_ok());
     }
 
     // Run on a paused runtime so that the payment interval sleeps auto-advance rather than
