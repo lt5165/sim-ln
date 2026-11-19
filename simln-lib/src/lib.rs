@@ -1127,11 +1127,13 @@ impl<C: Clock + 'static> Simulation<C> {
             )
             .await
             {
-                shutdown.trigger();
                 log::error!("Consume simulation results exited with error: {e:?}.");
             } else {
-                log::debug!("Consume simulation result received shutdown signal.");
+                log::debug!("Consume simulation results exited.");
             }
+            // The consumer exits on shutdown, on error, or when every payment has been dispatched and its result
+            // recorded (when the payment events producer has finished). In all cases, the simulation is over.
+            shutdown.trigger();
         });
 
         log::debug!("Simulator data collection set up.");
@@ -1289,10 +1291,12 @@ impl<C: Clock + 'static> Simulation<C> {
             .await
             {
                 log::error!("Produce payment events exited with error: {e:?}.");
+                shutdown.trigger();
             } else {
+                // Don't shut down yet: payments dispatched last may still be in flight. Once they have all been sent
+                // and resolved, the results pipeline closes and its consumer shuts the simulation down.
                 log::debug!("Produce payment events completed successfully.");
             }
-            shutdown.trigger();
         });
         Ok(())
     }
