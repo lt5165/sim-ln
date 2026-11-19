@@ -2806,6 +2806,7 @@ dependencies = [
  "bitcoin 0.32.11",
  "clap",
  "console-subscriber",
+ "csv",
  "ctrlc",
  "dialoguer",
  "futures",

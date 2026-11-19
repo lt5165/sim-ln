@@ -12,13 +12,14 @@ use simln_lib::sim_node::{
 use simln_lib::{
     cln, cln::ClnNode, eclair, eclair::EclairNode, ldk_server, ldk_server::LdkServerNode, lnd,
     lnd::LndNode, serializers, ActivityDefinition, Amount, Interval, LightningError, LightningNode,
-    NodeId, NodeInfo, Simulation, SimulationCfg, WriteResults,
+    NodeId, NodeInfo, Simulation, SimulationCfg, TracePayment, WriteResults,
 };
 use simln_lib::{ShortChannelID, SimulationError};
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio_util::task::TaskTracker;
 
@@ -157,6 +158,24 @@ impl Cli {
             probing.validate()?;
         }
 
+        if sim_params.trace.is_some() {
+            if sim_params.sim_network.is_empty() {
+                return Err(anyhow!(
+                    "Trace replay is only allowed when running on a simulated network"
+                ));
+            }
+            if !sim_params.activity.is_empty() {
+                return Err(anyhow!(
+                    "Simulation file cannot contain both a trace and activity"
+                ));
+            }
+            if !sim_params.exclude.is_empty() {
+                return Err(anyhow!(
+                    "List of nodes to exclude is only allowed on random activity, not with a trace"
+                ));
+            }
+        }
+
         if !sim_params.exclude.is_empty() {
             if sim_params.sim_network.is_empty() {
                 return Err(anyhow!(
@@ -189,6 +208,30 @@ pub struct SimParams {
     /// Optional background probing configuration, only available on a simulated network.
     #[serde(default)]
     pub probing: Option<ProbingConfig>,
+    /// Optional path to a CSV trace of payments to replay (`time_secs,source,destination,amount_msat`), relative to
+    /// the simulation file's folder. Only available on a simulated network, and not with `activity` or `exclude`.
+    #[serde(default)]
+    pub trace: Option<PathBuf>,
+}
+
+/// One row of a trace CSV: `source` pays `destination` `amount_msat` (excluding routing fees) at `time_secs` after the
+/// start of the simulation.
+#[derive(Debug, Deserialize)]
+struct TraceRow {
+    time_secs: f64,
+    #[serde(with = "serializers::serde_node_id")]
+    source: NodeId,
+    #[serde(with = "serializers::serde_node_id")]
+    destination: NodeId,
+    amount_msat: u64,
+}
+
+/// The payments that a simulation sends.
+pub enum Payments {
+    /// Defined activities, or random activity if there are none.
+    Activity(Vec<ActivityDefinition>),
+    /// Payments replayed from a trace.
+    Trace(Vec<TracePayment>),
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -242,6 +285,58 @@ struct ActivityValidationParams {
     graph_nodes_by_alias: HashMap<String, Vec<NodeInfo>>,
 }
 
+impl ActivityValidationParams {
+    /// Looks up a payment source, which must be a node that we control. `kind` names the payment's origin (activity
+    /// or trace) in errors.
+    fn source(&self, id: &NodeId, kind: &str) -> Result<NodeInfo, LightningError> {
+        // We can only map source aliases to nodes we control, so if the source alias
+        // is not in alias_node_map, we fail
+        match id {
+            NodeId::PublicKey(pk) => self.pk_node_map.get(pk),
+            NodeId::Alias(a) => self.alias_node_map.get(a),
+        }
+        .cloned()
+        .ok_or_else(|| {
+            LightningError::ValidationError(format!("{kind} source {id} not found in nodes."))
+        })
+    }
+
+    /// Looks up a payment destination, which can be any node in the graph. `kind` names the payment's origin
+    /// (activity or trace) in errors.
+    fn destination(&self, id: &NodeId, kind: &str) -> Result<NodeInfo, LightningError> {
+        let unknown =
+            || LightningError::ValidationError(format!("unknown {kind} destination: {id}."));
+        match id {
+            NodeId::Alias(a) => {
+                if let Some(node_info) = self.alias_node_map.get(a) {
+                    Ok(node_info.clone())
+                } else if let Some(node_infos) = self.graph_nodes_by_alias.get(a) {
+                    if node_infos.len() > 1 {
+                        let pks: Vec<PublicKey> = node_infos
+                            .iter()
+                            .map(|node_info| node_info.pubkey)
+                            .collect();
+                        return Err(LightningError::ValidationError(format!(
+                            "Multiple nodes in the graph have the same destination alias - {}. 
+                            Use one of these public keys as the destination instead - {:?}",
+                            a, pks
+                        )));
+                    }
+                    Ok(node_infos[0].clone())
+                } else {
+                    Err(unknown())
+                }
+            },
+            NodeId::PublicKey(pk) => self
+                .pk_node_map
+                .get(pk)
+                .or_else(|| self.graph_nodes_by_pk.get(pk))
+                .cloned()
+                .ok_or_else(unknown),
+        }
+    }
+}
+
 impl TryFrom<&Cli> for SimulationCfg {
     type Error = anyhow::Error;
 
@@ -289,7 +384,7 @@ pub async fn create_simulation_with_network(
 ) -> Result<
     (
         Simulation<SimulationClock>,
-        Vec<ActivityDefinition>,
+        Payments,
         HashMap<PublicKey, Arc<SimNode<SimGraph, SimulationClock>>>,
     ),
     anyhow::Error,
@@ -300,6 +395,7 @@ pub async fn create_simulation_with_network(
         activity: _activity,
         exclude,
         probing,
+        trace,
     } = sim_params;
 
     // Convert nodes representation for parsing to SimulatedChannel
@@ -361,8 +457,12 @@ pub async fn create_simulation_with_network(
         nodes_dyn.remove(pk);
     }
 
-    let validated_activities =
-        get_validated_activities(&nodes_dyn, nodes_info, sim_params.activity.clone()).await?;
+    let payments = match trace {
+        Some(path) => Payments::Trace(get_validated_trace(&nodes_dyn, &nodes_info, path).await?),
+        None => Payments::Activity(
+            get_validated_activities(&nodes_dyn, nodes_info, sim_params.activity.clone()).await?,
+        ),
+    };
 
     let seed = cfg.seed();
     let simulation = Simulation::new(
@@ -398,7 +498,7 @@ pub async fn create_simulation_with_network(
         shutdown_listener,
     ));
 
-    Ok((simulation, validated_activities, nodes))
+    Ok((simulation, payments, nodes))
 }
 
 /// Creates a simulation to be run against a set of real lightning nodes, connecting to the nodes described in
@@ -409,13 +509,14 @@ pub async fn create_simulation(
     sim_params: &SimParams,
     clock: Arc<SimulationClock>,
     tasks: TaskTracker,
-) -> Result<(Simulation<SimulationClock>, Vec<ActivityDefinition>), anyhow::Error> {
+) -> Result<(Simulation<SimulationClock>, Payments), anyhow::Error> {
     let SimParams {
         nodes,
         sim_network: _sim_network,
         activity: _activity,
         exclude: _,
         probing: _,
+        trace: _,
     } = sim_params;
 
     let (clients, clients_info) = get_clients(nodes.to_vec()).await?;
@@ -433,7 +534,7 @@ pub async fn create_simulation(
             shutdown_trigger,
             shutdown_listener,
         ),
-        validated_activities,
+        Payments::Activity(validated_activities),
     ))
 }
 
@@ -518,66 +619,10 @@ async fn validate_activities(
 ) -> Result<Vec<ActivityDefinition>, LightningError> {
     let mut validated_activities = vec![];
 
-    let ActivityValidationParams {
-        pk_node_map,
-        alias_node_map,
-        graph_nodes_by_pk,
-        graph_nodes_by_alias,
-    } = activity_validation_params;
-
     // Make all the activities identifiable by PK internally
     for act in activity.into_iter() {
-        // We can only map source aliases to nodes we control, so if the source alias
-        // is not in alias_node_map, we fail
-        let source = if let Some(source) = match &act.source {
-            NodeId::PublicKey(pk) => pk_node_map.get(pk),
-            NodeId::Alias(a) => alias_node_map.get(a),
-        } {
-            source.clone()
-        } else {
-            return Err(LightningError::ValidationError(format!(
-                "activity source {} not found in nodes.",
-                act.source
-            )));
-        };
-
-        let destination = match &act.destination {
-            NodeId::Alias(a) => {
-                if let Some(node_info) = alias_node_map.get(a) {
-                    node_info.clone()
-                } else if let Some(node_infos) = graph_nodes_by_alias.get(a) {
-                    if node_infos.len() > 1 {
-                        let pks: Vec<PublicKey> = node_infos
-                            .iter()
-                            .map(|node_info| node_info.pubkey)
-                            .collect();
-                        return Err(LightningError::ValidationError(format!(
-                            "Multiple nodes in the graph have the same destination alias - {}. 
-                            Use one of these public keys as the destination instead - {:?}",
-                            a, pks
-                        )));
-                    }
-                    node_infos[0].clone()
-                } else {
-                    return Err(LightningError::ValidationError(format!(
-                        "unknown activity destination: {}.",
-                        act.destination
-                    )));
-                }
-            },
-            NodeId::PublicKey(pk) => {
-                if let Some(node_info) = pk_node_map.get(pk) {
-                    node_info.clone()
-                } else if let Some(node_info) = graph_nodes_by_pk.get(pk) {
-                    node_info.clone()
-                } else {
-                    return Err(LightningError::ValidationError(format!(
-                        "unknown activity destination: {}.",
-                        act.destination
-                    )));
-                }
-            },
-        };
+        let source = activity_validation_params.source(&act.source, "activity")?;
+        let destination = activity_validation_params.destination(&act.destination, "activity")?;
 
         validated_activities.push(ActivityDefinition {
             source,
@@ -648,7 +693,7 @@ fn mkdir(dir: PathBuf) -> anyhow::Result<PathBuf> {
 
 pub fn parse_sim_params(cli: &Cli) -> anyhow::Result<SimParams> {
     let sim_path = read_sim_path(cli.data_dir.clone(), cli.sim_file.clone())?;
-    let sim_params = serde_json::from_str(&std::fs::read_to_string(sim_path)?).map_err(|e| {
+    let mut sim_params: SimParams = serde_json::from_str(&std::fs::read_to_string(&sim_path)?).map_err(|e| {
         anyhow!(
             "Could not deserialize node connection data or activity description from simulation file (line {}, col {}, err: {}).",
             e.line(),
@@ -656,6 +701,14 @@ pub fn parse_sim_params(cli: &Cli) -> anyhow::Result<SimParams> {
             e.to_string()
         )
         })?;
+
+    // A relative trace path is relative to the simulation file, not the working directory.
+    if let Some(trace) = &sim_params.trace {
+        if trace.is_relative() {
+            let dir = sim_path.parent().unwrap_or(std::path::Path::new(""));
+            sim_params.trace = Some(dir.join(trace));
+        }
+    }
     Ok(sim_params)
 }
 
@@ -664,6 +717,60 @@ pub async fn get_validated_activities(
     nodes_info: HashMap<PublicKey, NodeInfo>,
     activity: Vec<ActivityParser>,
 ) -> Result<Vec<ActivityDefinition>, LightningError> {
+    let activity_validation_params = get_validation_params(clients, &nodes_info).await?;
+    validate_activities(activity.to_vec(), activity_validation_params).await
+}
+
+/// Reads a trace CSV and checks every row, returning its payments. Sources must be nodes that we control and
+/// destinations nodes in the graph (by public key or unique alias); times must be finite and not negative, and are
+/// rounded to the millisecond.
+pub async fn get_validated_trace(
+    clients: &HashMap<PublicKey, Arc<dyn LightningNode>>,
+    nodes_info: &HashMap<PublicKey, NodeInfo>,
+    path: &std::path::Path,
+) -> anyhow::Result<Vec<TracePayment>> {
+    let params = get_validation_params(clients, nodes_info).await?;
+    let mut reader = csv::Reader::from_path(path)
+        .map_err(|e| anyhow!("Could not open trace {}: {e}", path.display()))?;
+
+    let mut trace = Vec::new();
+    for (i, row) in reader.deserialize::<TraceRow>().enumerate() {
+        // Line 1 is the header.
+        let line = i + 2;
+        let row = row.map_err(|e| anyhow!("Trace {} line {line}: {e}", path.display()))?;
+        if !row.time_secs.is_finite() || row.time_secs < 0.0 {
+            anyhow::bail!(
+                "Trace {} line {line}: time_secs must be a non-negative number, got {}",
+                path.display(),
+                row.time_secs
+            );
+        }
+        trace.push(TracePayment {
+            time: Duration::from_millis((row.time_secs * 1000.0).round() as u64),
+            source: params
+                .source(&row.source, "trace")
+                .map_err(|e| anyhow!("Trace {} line {line}: {e}", path.display()))?,
+            destination: params
+                .destination(&row.destination, "trace")
+                .map_err(|e| anyhow!("Trace {} line {line}: {e}", path.display()))?,
+            amount_msat: row.amount_msat,
+        });
+    }
+
+    log::info!(
+        "Read {} payments from trace {}.",
+        trace.len(),
+        path.display()
+    );
+    Ok(trace)
+}
+
+/// Builds the node lookups used to validate activity and traces: the nodes we control (`nodes_info`) and every node
+/// in the graph, by public key and by alias.
+async fn get_validation_params(
+    clients: &HashMap<PublicKey, Arc<dyn LightningNode>>,
+    nodes_info: &HashMap<PublicKey, NodeInfo>,
+) -> Result<ActivityValidationParams, LightningError> {
     // We need to be able to look up destination nodes in the graph, because we allow defined activities to send to
     // nodes that we do not control. To do this, we can just grab the first node in our map and perform the lookup.
     let graph = match clients.values().next() {
@@ -685,14 +792,12 @@ pub async fn get_validated_activities(
     let NodeMapping {
         pk_node_map,
         alias_node_map,
-    } = add_node_to_maps(&nodes_info)?;
+    } = add_node_to_maps(nodes_info)?;
 
-    let activity_validation_params = ActivityValidationParams {
+    Ok(ActivityValidationParams {
         pk_node_map,
         alias_node_map,
         graph_nodes_by_pk: graph.nodes_by_pk,
         graph_nodes_by_alias,
-    };
-
-    validate_activities(activity.to_vec(), activity_validation_params).await
+    })
 }
