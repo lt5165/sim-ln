@@ -216,6 +216,7 @@ impl LightningNode for LndNode {
                             htlc_count: payment.htlcs.len(),
                             payment_outcome,
                             failure: None,
+                            fee_msat: None,
                         });
                     },
                     None => {

@@ -198,6 +198,7 @@ impl LightningNode for EclairNode {
                             htlc_count,
                             payment_outcome,
                             failure: None,
+                            fee_msat: None,
                         });
                     }
                 },

@@ -230,6 +230,7 @@ impl LightningNode for ClnNode {
                             htlc_count,
                             payment_outcome,
                             failure: None,
+                            fee_msat: None,
                         });
                     }
                 },

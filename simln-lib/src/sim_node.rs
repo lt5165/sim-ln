@@ -953,6 +953,7 @@ impl<T: SimNetwork, C: Clock> LightningNode for SimNode<T, C> {
                     htlc_count: 0,
                     payment_outcome: PaymentOutcome::RouteNotFound,
                     failure: None,
+                    fee_msat: None,
                 })) {
                     log::error!("Could not send payment result: {:?}.", e);
                 }
@@ -1009,8 +1010,8 @@ impl<T: SimNetwork, C: Clock> LightningNode for SimNode<T, C> {
 
                     // If we get a payment result back, remove from our in flight set of payments and return the result.
                     res = in_flight.track_payment_receiver => {
-                        let track_result = res.map_err(|e| LightningError::TrackPaymentError(format!("channel receive err: {}", e)))?;
-                        if let Ok(ref payment_result) = track_result {
+                        let mut track_result = res.map_err(|e| LightningError::TrackPaymentError(format!("channel receive err: {}", e)))?;
+                        if let Ok(ref mut payment_result) = track_result {
                             let duration = match self.clock.now().duration_since(UNIX_EPOCH) {
                                 Ok(d) => d,
                                 Err(e) => {
@@ -1024,6 +1025,7 @@ impl<T: SimNetwork, C: Clock> LightningNode for SimNode<T, C> {
                                         LightningError::TrackPaymentError(format!("scorer lock poisoned: {e}"))
                                     })?;
                                     if payment_result.payment_outcome == PaymentOutcome::Success {
+                                        payment_result.fee_msat = Some(path.fee_msat());
                                         scorer.payment_path_successful(path, duration);
                                     } else if let PaymentOutcome::IndexFailure(index) = payment_result.payment_outcome {
                                         // The scorer expects the short channel id of the failing channel, not the
@@ -1514,6 +1516,7 @@ impl SimNetwork for SimGraph {
                     htlc_count: 0,
                     payment_outcome: PaymentOutcome::RouteNotFound,
                     failure: None,
+                    fee_msat: None,
                 })) {
                     log::error!("Could not send payment result: {:?}.", e);
                 }
@@ -1549,6 +1552,7 @@ impl SimNetwork for SimGraph {
                 htlc_count: 0,
                 payment_outcome: PaymentOutcome::RouteNotFound,
                 failure: None,
+                fee_msat: None,
             })) {
                 log::error!("Could not send probe result: {:?}.", e);
             }
@@ -1895,6 +1899,7 @@ async fn propagate_payment(request: PropagatePaymentRequest) {
                 htlc_count: 1,
                 payment_outcome: PaymentOutcome::Success,
                 failure: None,
+                fee_msat: None,
             }
         },
         Ok(Err((fail_idx, fwd_err))) => {
@@ -1939,6 +1944,7 @@ async fn propagate_payment(request: PropagatePaymentRequest) {
                 htlc_count: 0,
                 payment_outcome: PaymentOutcome::IndexFailure(failed_index),
                 failure: Some(failure),
+                fee_msat: None,
             }
         },
         Err(critical_err) => {
@@ -1951,6 +1957,7 @@ async fn propagate_payment(request: PropagatePaymentRequest) {
                 htlc_count: 0,
                 payment_outcome: PaymentOutcome::Unknown,
                 failure: None,
+                fee_msat: None,
             }
         },
     };
@@ -2640,6 +2647,10 @@ mod tests {
         let dest_1 = channels[2].node_1.policy.pubkey;
         let dest_2 = channels[4].node_1.policy.pubkey;
 
+        // The routing fee of the path that the successful payment is dispatched on.
+        let path_fee = Arc::new(std::sync::Mutex::new(None));
+        let path_fee_mock = path_fee.clone();
+
         sim_network
             .lock()
             .await
@@ -2654,16 +2665,19 @@ mod tests {
                     // receiver.
                     let receiver = route.paths[0].hops.last().unwrap().pubkey;
                     let result = if receiver == dest_1 {
+                        *path_fee_mock.lock().unwrap() = Some(route.paths[0].fee_msat());
                         PaymentResult {
                             htlc_count: 2,
                             payment_outcome: PaymentOutcome::Success,
                             failure: None,
+                            fee_msat: None,
                         }
                     } else if receiver == dest_2 {
                         PaymentResult {
                             htlc_count: 0,
                             payment_outcome: PaymentOutcome::InsufficientBalance,
                             failure: None,
+                            fee_msat: None,
                         }
                     } else {
                         panic!("unknown mocked receiver");
@@ -2684,6 +2698,9 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(result_1.payment_outcome, PaymentOutcome::Success));
+        // A successful payment reports the fees of the path it was sent on.
+        assert!(path_fee.lock().unwrap().is_some());
+        assert_eq!(result_1.fee_msat, *path_fee.lock().unwrap());
 
         let result_2 = node
             .track_payment(&hash_2, shutdown_listener.clone())
@@ -2693,6 +2710,7 @@ mod tests {
             result_2.payment_outcome,
             PaymentOutcome::InsufficientBalance
         ));
+        assert_eq!(result_2.fee_msat, None);
     }
 
     #[tokio::test]

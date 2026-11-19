@@ -438,6 +438,10 @@ pub struct PaymentResult {
     /// see the exact forwarding error. Not included in the payment results CSV, to keep its format unchanged.
     #[serde(skip)]
     pub failure: Option<FailureDetails>,
+    /// The routing fees that the sender paid on top of the amount, for a successful payment. Only the simulated
+    /// network provides this. Not included in the payment results CSV, to keep its format unchanged.
+    #[serde(skip)]
+    pub fee_msat: Option<u64>,
 }
 
 /// Details of where and why an HTLC failed in the simulated network.
@@ -461,6 +465,7 @@ impl PaymentResult {
             htlc_count: 0,
             payment_outcome: PaymentOutcome::NotDispatched,
             failure: None,
+            fee_msat: None,
         }
     }
 
@@ -472,6 +477,7 @@ impl PaymentResult {
             htlc_count: 0,
             payment_outcome: PaymentOutcome::TrackPaymentFailed,
             failure: None,
+            fee_msat: None,
         }
     }
 }
@@ -2278,6 +2284,7 @@ mod tests {
                 htlc_count: 1,
                 payment_outcome: crate::PaymentOutcome::Success,
                 failure: None,
+                fee_msat: None,
             })
         });
 

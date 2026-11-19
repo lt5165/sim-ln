@@ -57,6 +57,9 @@ pub struct EventRecord {
     pub failure_reason: Option<String>,
     /// The full failure message, including the values that caused it.
     pub failure_detail: Option<String>,
+    /// The routing fees paid on top of `amount_msat`, for a successful payment on the simulated network. Empty for
+    /// failed payments and probes.
+    pub fee_msat: Option<u64>,
 }
 
 impl EventRecord {
@@ -82,6 +85,7 @@ impl EventRecord {
             failed_scid: failure.and_then(|f| f.failed_scid),
             failure_reason: failure.map(|f| f.reason.clone()),
             failure_detail: failure.map(|f| f.detail.clone()),
+            fee_msat: result.fee_msat,
         }
     }
 }
@@ -334,6 +338,7 @@ mod tests {
                 htlc_count: 1,
                 payment_outcome: PaymentOutcome::Success,
                 failure: None,
+                fee_msat: Some(1_234),
             },
         ))
         .unwrap();
@@ -352,6 +357,7 @@ mod tests {
                     reason: "InsufficientBalance".to_string(),
                     detail: "InsufficientBalance: amount: 2000 > balance: 10".to_string(),
                 }),
+                fee_msat: None,
             },
         ))
         .unwrap();
@@ -371,16 +377,18 @@ mod tests {
                 "payment_outcome",
                 "failed_scid",
                 "failure_reason",
-                "failure_detail"
+                "failure_detail",
+                "fee_msat"
             ]
         );
         assert_eq!(rows[1][0], "payment");
         assert_eq!(rows[1][7], "Success");
-        assert_eq!(rows[1][8..], ["", "", ""]);
+        assert_eq!(rows[1][8..], ["", "", "", "1234"]);
         assert_eq!(rows[2][0], "probe");
         assert_eq!(rows[2][7], "IndexFailure(2)");
         assert_eq!(rows[2][8], "42");
         assert_eq!(rows[2][9], "InsufficientBalance");
+        assert_eq!(rows[2][11], "");
 
         // No probe balances were logged, so there should be no balances file.
         assert!(!dir.path().join("probe_balances_1700000000.csv").exists());

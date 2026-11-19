@@ -154,6 +154,7 @@ impl LightningNode for LdkServerNode {
                         htlc_count: 1,
                         payment_outcome,
                         failure: None,
+                        fee_msat: None,
                     });
                 },
             }
