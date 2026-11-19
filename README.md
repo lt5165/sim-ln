@@ -309,6 +309,9 @@ The same directory also contains:
     could not carry a failed HTLC, the kind of failure (e.g.
     `InsufficientBalance`, `ExceedsInFlightTotal`) and the full failure
     message. These are only known on a simulated network.
+  * `fee_msat`: the routing fees that the sender paid on top of
+    `amount_msat`, for a successful payment on a simulated network. Empty
+    for failed payments and probes.
 
   `payment_outcome` is written in full, e.g. `IndexFailure(2)` for a
   failure at the channel at hop index 2 of the path. For probes, `Success`
@@ -456,6 +459,43 @@ send/receive payments, you can include them in an `exclude` list:
 This is required for the case where you want to specify a channel that
 will be used in the simulated network that is just responsible for 
 forwarding payments, but does not send or receive any payments itself.
+
+### Trace Replay
+
+Instead of generating payments, a simulated network can replay a fixed
+list of payments, for example one generated from external data. Set
+`trace` to the path of a CSV file (relative paths are relative to the
+simulation file's folder):
+
+```
+{
+  "sim_network": [ ... ],
+  "trace": "trace.csv"
+}
+```
+
+The CSV has one row per payment:
+
+```
+time_secs,source,destination,amount_msat
+12.5,0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798,020a30431ce58843eedf8051214dbfadb65b107cc598b8277f14bb9b33c9cd026f,60000000
+13.1,020a30431ce58843eedf8051214dbfadb65b107cc598b8277f14bb9b33c9cd026f,Bob,60000000
+```
+
+* `time_secs`: when to send the payment, in seconds from the start of
+  the simulation. Fractions are allowed, rounded to the millisecond.
+* `source`: the sending node, by public key or alias. It must be a node
+  in `sim_network`.
+* `destination`: the receiving node, by public key or unique alias.
+* `amount_msat`: the amount the destination receives. As for other
+  payments, the sender pays routing fees on top (see `fee_msat` in the
+  events log).
+
+Each payment is sent once, at its time: rows don't need to be sorted,
+and rows with the same time are sent in file order. The simulation ends
+once every payment has been sent and resolved, or at `--total-time`,
+whichever comes first. A trace can't be combined with `activity` or
+`exclude`, but can be combined with `probing`.
 
 ### Converting an LND Graph Snapshot
 
