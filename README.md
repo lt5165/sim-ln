@@ -522,11 +522,20 @@ the script fills in:
 * Balances are never public: each channel starts split 50/50.
 
 It skips channels that have no policy for one direction, zero capacity,
-the same node at both ends, or a repeated channel id. The simulated
-network can't represent disabled channels, so they are kept as usable
-unless you pass `--drop-disabled`, which drops any channel with a
-disabled direction. Aliases shared by more than one node are cleared,
-because sim-ln requires unique aliases.
+the same node at both ends, or a repeated channel id. Aliases shared by
+more than one node are cleared, because sim-ln requires unique aliases.
+
+A direction is disabled when its node isn't forwarding over the channel
+at the time of the snapshot, usually because the peer is offline. The
+simulated network has no "disabled" setting, so `--disabled` chooses how
+to treat these directions:
+* `keep` (default): treat them as usable.
+* `drop` (or `--drop-disabled`): drop any channel with a disabled
+  direction.
+* `block`: give each disabled direction a `max_htlc_size_msat` of 0, so
+  that no payment can use it (pathfinding skips it and forwarding rejects
+  any HTLC), while the other direction keeps working. Channels disabled
+  in both directions are dropped.
 
 The script needs only the Python standard library. Its tests run with
 `python3 -m unittest discover scripts`.

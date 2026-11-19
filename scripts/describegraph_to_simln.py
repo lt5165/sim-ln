@@ -17,10 +17,17 @@ filled with defaults:
 - Balances are never gossiped: sim-ln splits each channel's capacity 50/50.
 
 Channels are skipped if either direction has no policy, if their capacity is zero,
-if both ends are the same node, or if their channel id was already seen. sim-ln
-can't represent disabled channels, so they are kept as usable unless
---drop-disabled is passed (which drops a channel if either direction is disabled).
-Node aliases that are not unique are cleared, because sim-ln rejects duplicates.
+if both ends are the same node, or if their channel id was already seen. Node aliases
+that are not unique are cleared, because sim-ln rejects duplicates.
+
+A disabled direction (its node isn't forwarding over the channel when the snapshot was
+taken, usually because the peer is offline) has no direct equivalent in sim-ln, so
+--disabled chooses how to treat it:
+- keep (default): treat it as usable.
+- drop: drop any channel with a disabled direction (--drop-disabled is an alias).
+- block: give the disabled direction a max_htlc_size_msat of 0, so that no payment can
+  use it (pathfinding skips it and forwarding rejects any HTLC), while the other
+  direction keeps working. Channels disabled in both directions are dropped.
 
 Only the Python standard library is needed.
 """
@@ -50,9 +57,14 @@ def convert_policy(pubkey, alias, policy, capacity_msat):
     }
 
 
-def convert_graph(graph, drop_disabled=False):
+DISABLED_MODES = ("keep", "drop", "block")
+
+
+def convert_graph(graph, disabled="keep"):
     """Converts a parsed describegraph dump, returning the sim-ln simulation file and a counter of what was
-    kept and skipped."""
+    kept and skipped. `disabled` is one of DISABLED_MODES (see the module docstring)."""
+    if disabled not in DISABLED_MODES:
+        raise ValueError(f"disabled must be one of {DISABLED_MODES}, not {disabled!r}")
     stats = collections.Counter()
 
     # sim-ln rejects duplicate aliases, but allows empty ones, so only unique aliases are kept.
@@ -85,26 +97,28 @@ def convert_graph(graph, drop_disabled=False):
             stats["skipped: duplicate channel id"] += 1
             continue
 
-        disabled = policy_1.get("disabled") or policy_2.get("disabled")
-        if disabled and drop_disabled:
-            stats["skipped: disabled"] += 1
-            continue
-        if disabled:
-            stats["kept, with a disabled direction treated as usable"] += 1
+        disabled_1, disabled_2 = bool(policy_1.get("disabled")), bool(policy_2.get("disabled"))
+        if disabled_1 or disabled_2:
+            if disabled == "drop":
+                stats["skipped: disabled"] += 1
+                continue
+            if disabled == "block" and disabled_1 and disabled_2:
+                stats["skipped: disabled in both directions"] += 1
+                continue
+            if disabled == "keep":
+                stats["kept, with a disabled direction treated as usable"] += 1
+            else:
+                stats["kept, with the disabled direction blocked"] += 1
+
+        node_1 = convert_policy(edge["node1_pub"], aliases.get(edge["node1_pub"], ""), policy_1, capacity_msat)
+        node_2 = convert_policy(edge["node2_pub"], aliases.get(edge["node2_pub"], ""), policy_2, capacity_msat)
+        if disabled == "block":
+            for policy, is_disabled in ((node_1, disabled_1), (node_2, disabled_2)):
+                if is_disabled:
+                    policy["max_htlc_size_msat"] = 0
 
         seen_ids.add(scid)
-        channels.append(
-            {
-                "scid": scid,
-                "capacity_msat": capacity_msat,
-                "node_1": convert_policy(
-                    edge["node1_pub"], aliases.get(edge["node1_pub"], ""), policy_1, capacity_msat
-                ),
-                "node_2": convert_policy(
-                    edge["node2_pub"], aliases.get(edge["node2_pub"], ""), policy_2, capacity_msat
-                ),
-            }
-        )
+        channels.append({"scid": scid, "capacity_msat": capacity_msat, "node_1": node_1, "node_2": node_2})
         stats["channels"] += 1
 
     nodes = {c["node_1"]["pubkey"] for c in channels} | {c["node_2"]["pubkey"] for c in channels}
@@ -119,16 +133,25 @@ def main():
     parser.add_argument("graph", help="path to the describegraph JSON dump")
     parser.add_argument("output", help="path to write the sim-ln simulation file to")
     parser.add_argument(
+        "--disabled",
+        choices=DISABLED_MODES,
+        default="keep",
+        help="how to treat disabled directions: keep them as usable (default), drop their channels, or block only "
+        "the disabled direction",
+    )
+    parser.add_argument(
         "--drop-disabled",
-        action="store_true",
-        help="drop channels with either direction disabled (by default they are kept as usable)",
+        dest="disabled",
+        action="store_const",
+        const="drop",
+        help="same as --disabled drop",
     )
     args = parser.parse_args()
 
     with open(args.graph) as f:
         graph = json.load(f)
 
-    sim, stats = convert_graph(graph, drop_disabled=args.drop_disabled)
+    sim, stats = convert_graph(graph, disabled=args.disabled)
 
     with open(args.output, "w") as f:
         json.dump(sim, f)

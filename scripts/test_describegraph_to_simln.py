@@ -107,9 +107,35 @@ class ConvertGraphTest(unittest.TestCase):
         self.assertEqual(len(sim["sim_network"]), 2)
         self.assertEqual(stats["kept, with a disabled direction treated as usable"], 1)
 
-        sim, stats = convert_graph(graph(edges), drop_disabled=True)
+        sim, stats = convert_graph(graph(edges), disabled="drop")
         self.assertEqual([c["scid"] for c in sim["sim_network"]], [2])
         self.assertEqual(stats["skipped: disabled"], 1)
+
+    def test_block_disabled_directions(self):
+        edges = [
+            edge("1", A, B, p1=policy(disabled=True)),
+            edge("2", B, C, p2=policy(disabled=True, max_htlc_msat="500000000")),
+            edge("3", A, C, p1=policy(disabled=True), p2=policy(disabled=True)),
+            edge("4", B, C, capacity="2000000"),
+        ]
+        sim, stats = convert_graph(graph(edges), disabled="block")
+        channels = {c["scid"]: c for c in sim["sim_network"]}
+
+        # Only the disabled direction is blocked; the other direction keeps its limit.
+        self.assertEqual(channels[1]["node_1"]["max_htlc_size_msat"], 0)
+        self.assertEqual(channels[1]["node_2"]["max_htlc_size_msat"], 1_000_000_000)
+        self.assertEqual(channels[2]["node_1"]["max_htlc_size_msat"], 1_000_000_000)
+        self.assertEqual(channels[2]["node_2"]["max_htlc_size_msat"], 0)
+        # A channel disabled in both directions has no usable direction, so it's dropped.
+        self.assertNotIn(3, channels)
+        self.assertEqual(stats["skipped: disabled in both directions"], 1)
+        self.assertEqual(stats["kept, with the disabled direction blocked"], 2)
+        # Enabled channels are untouched.
+        self.assertEqual(channels[4]["node_1"]["max_htlc_size_msat"], 2_000_000_000)
+
+    def test_rejects_unknown_disabled_mode(self):
+        with self.assertRaises(ValueError):
+            convert_graph(graph([edge("1", A, B)]), disabled="ignore")
 
     def test_clears_duplicate_aliases(self):
         sim, stats = convert_graph(
