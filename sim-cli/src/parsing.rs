@@ -94,8 +94,8 @@ pub struct Cli {
     /// Seed to run random activity generator deterministically
     #[clap(long, short)]
     pub fix_seed: Option<u64>,
-    /// Latency to optionally introduce for payments in a simulated network expressed in
-    /// milliseconds.
+    /// Mean per-hop latency in milliseconds to optionally introduce for payments in a simulated network. Each hop
+    /// samples a Poisson-distributed delay as the HTLC is forwarded, and again as its settle or failure travels back.
     #[clap(long)]
     pub latency_ms: Option<u32>,
     /// Run the simulated network on virtual time: time advances instantly to the next event instead of sleeping on the
